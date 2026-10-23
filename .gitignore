@@ -1,33 +1,95 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
+# ==============================================================================
+# Go
+# ==============================================================================
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-
-# Test binary, built with `go test -c`
 *.test
-
-# Code coverage profiles and other test artifacts
 *.out
 coverage.*
 !coverage.go
 *.coverprofile
 profile.cov
-
-# Dependency directories (remove the comment below to include it)
-# vendor/
-
-# Go workspace file
 go.work
 go.work.sum
 
-# env file
-.env
+# Compiled application binaries
+/automain
+/bin/
+/dist/
+/build/
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# ==============================================================================
+# SQLite & Local Application Data
+# ==============================================================================
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+/data/
+/.automain-dev/
+/scratch/
+/tmp/
+
+# ==============================================================================
+# Svelte / Frontend
+# ==============================================================================
+node_modules/
+.svelte-kit/
+.vite/
+*.tsbuildinfo
+.npm
+.pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ==============================================================================
+# Environment & Secrets
+# ==============================================================================
+.env
+.env.*
+/testing.env
+!.env.example
+!.env.*.example
+
+# ==============================================================================
+# OS & Editor Metadata
+# ==============================================================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ==============================================================================
+# Project Documentation & Agent / LLM Instructions (Never Commit)
+# ==============================================================================
+/docs/
+/work-orders/
+AGENTS.md
+agents.md
+WATCHDOG.md
+watchdog.md
+ADVISOR.md
+advisor.md
+CLAUDE.md
+claude.md
+GEMINI.md
+gemini.md
+*.agent.md
+*.instructions.md
+*.prompt.md
+/.agent/
+/.agents/
+/.claude/
+/.cursor/
+/.gemini/
