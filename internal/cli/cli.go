@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,17 +25,20 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 	if err != nil {
 		return writeError(stdout, stderr, jsonRequested, "cli", err)
 	}
-	if globalCfg.JSONOutput {
-		jsonRequested = true
-	}
+	jsonRequested = globalCfg.JSONOutput
 
 	if len(remaining) == 0 {
-		if helpRequested {
+		if helpRequested || len(args) == 0 {
 			writeMainUsage(stdout)
 			return 0
 		}
-		writeMainUsage(stdout)
-		return 0
+		return writeError(stdout, stderr, jsonRequested, "cli", domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"cli",
+			"Subcommand is required.",
+			"Run 'automain --help' to list supported commands: status, sync, analyze, threads, relationships, stats, serve, version.",
+			nil,
+		))
 	}
 
 	subcmd := remaining[0]
@@ -65,6 +69,15 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 		if helpRequested {
 			fmt.Fprintln(stdout, "Usage: automain version [--json]")
 			return 0
+		}
+		if len(subArgs) > 0 {
+			return writeError(stdout, stderr, jsonRequested, "version", domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"version",
+				fmt.Sprintf("Unexpected argument %q for version.", subArgs[0]),
+				"Run 'automain version [--json]'.",
+				nil,
+			))
 		}
 		if jsonRequested {
 			if err := writeJSONSuccess(stdout, "version", map[string]string{"version": app.Version}); err != nil {
@@ -137,23 +150,8 @@ func runSync(ctx context.Context, svc *app.Service, cfg config.Config, args []st
 	limit := fs.Int("limit", 0, "Maximum number of items to fetch")
 	sinceStr := fs.String("since", "", "Fetch updates since RFC3339 timestamp")
 	full := fs.Bool("full", false, "Ignore stored sync watermark and perform full import")
-	if err := fs.Parse(args); err != nil {
-		return writeError(stdout, stderr, jsonMode, "sync", domain.NewError(
-			domain.ErrorCodeInvalidInput,
-			"sync",
-			err.Error(),
-			"Run 'automain sync --help' to inspect valid flags.",
-			err,
-		))
-	}
-	if fs.NArg() > 0 {
-		return writeError(stdout, stderr, jsonMode, "sync", domain.NewError(
-			domain.ErrorCodeInvalidInput,
-			"sync",
-			fmt.Sprintf("Unexpected positional argument %q.", fs.Arg(0)),
-			"Pass repository via --repo <owner/name>.",
-			nil,
-		))
+	if err := parseSubcommandFlags(fs, "sync", args, "Run 'automain sync --help' to inspect valid flags."); err != nil {
+		return writeError(stdout, stderr, jsonMode, "sync", err)
 	}
 
 	var since *time.Time
@@ -199,23 +197,8 @@ func runAnalyze(ctx context.Context, svc *app.Service, cfg config.Config, args [
 	itemNum := fs.Int("item", 0, "Analyze a specific GitHub item number")
 	limit := fs.Int("limit", 0, "Maximum number of dirty items to analyze")
 	reanalyze := fs.Bool("reanalyze", false, "Re-run analysis even if item content hash matches")
-	if err := fs.Parse(args); err != nil {
-		return writeError(stdout, stderr, jsonMode, "analyze", domain.NewError(
-			domain.ErrorCodeInvalidInput,
-			"analyze",
-			err.Error(),
-			"Run 'automain analyze --help' to inspect valid flags.",
-			err,
-		))
-	}
-	if fs.NArg() > 0 {
-		return writeError(stdout, stderr, jsonMode, "analyze", domain.NewError(
-			domain.ErrorCodeInvalidInput,
-			"analyze",
-			fmt.Sprintf("Unexpected positional argument %q.", fs.Arg(0)),
-			"Pass options using flags (--repo, --item, --limit).",
-			nil,
-		))
+	if err := parseSubcommandFlags(fs, "analyze", args, "Run 'automain analyze --help' to inspect valid flags."); err != nil {
+		return writeError(stdout, stderr, jsonMode, "analyze", err)
 	}
 
 	res, err := svc.Analyze(ctx, domain.AnalyzeOptions{
@@ -253,14 +236,8 @@ func runThreads(ctx context.Context, svc *app.Service, cfg config.Config, args [
 		}
 		fs := newSubFlagSet("threads list")
 		status := fs.String("status", "", "Filter threads by status (active|resolved|stale)")
-		if err := fs.Parse(rest); err != nil {
-			return writeError(stdout, stderr, jsonMode, "threads.list", domain.NewError(
-				domain.ErrorCodeInvalidInput,
-				"threads.list",
-				err.Error(),
-				"Run 'automain threads --help' for usage.",
-				err,
-			))
+		if err := parseSubcommandFlags(fs, "threads.list", rest, "Run 'automain threads --help' for usage."); err != nil {
+			return writeError(stdout, stderr, jsonMode, "threads.list", err)
 		}
 		threads, err := svc.ListThreads(ctx, domain.ThreadFilter{
 			Repository: cfg.Repository,
@@ -285,14 +262,8 @@ func runThreads(ctx context.Context, svc *app.Service, cfg config.Config, args [
 		}
 		fs := newSubFlagSet("threads show")
 		id := fs.String("id", "", "Thread ID to inspect")
-		if err := fs.Parse(rest); err != nil {
-			return writeError(stdout, stderr, jsonMode, "threads.show", domain.NewError(
-				domain.ErrorCodeInvalidInput,
-				"threads.show",
-				err.Error(),
-				"Run 'automain threads show --help' for usage.",
-				err,
-			))
+		if err := parseSubcommandFlags(fs, "threads.show", rest, "Run 'automain threads show --help' for usage."); err != nil {
+			return writeError(stdout, stderr, jsonMode, "threads.show", err)
 		}
 		detail, err := svc.GetThread(ctx, domain.ThreadID(strings.TrimSpace(*id)))
 		if err != nil {
@@ -337,14 +308,8 @@ func runRelationships(ctx context.Context, svc *app.Service, cfg config.Config, 
 		itemNum := fs.Int("item", 0, "Filter by GitHub item number")
 		relType := fs.String("type", "", "Filter by relationship type")
 		verifiedStr := fs.String("verified", "", "Filter by human verification (true|false)")
-		if err := fs.Parse(rest); err != nil {
-			return writeError(stdout, stderr, jsonMode, "relationships.list", domain.NewError(
-				domain.ErrorCodeInvalidInput,
-				"relationships.list",
-				err.Error(),
-				"Run 'automain relationships --help' for usage.",
-				err,
-			))
+		if err := parseSubcommandFlags(fs, "relationships.list", rest, "Run 'automain relationships --help' for usage."); err != nil {
+			return writeError(stdout, stderr, jsonMode, "relationships.list", err)
 		}
 		var verifiedPtr *bool
 		if v := strings.TrimSpace(*verifiedStr); v != "" {
@@ -391,14 +356,8 @@ func runRelationships(ctx context.Context, svc *app.Service, cfg config.Config, 
 		}
 		fs := newSubFlagSet("relationships show")
 		id := fs.String("id", "", "Relationship ID to inspect")
-		if err := fs.Parse(rest); err != nil {
-			return writeError(stdout, stderr, jsonMode, "relationships.show", domain.NewError(
-				domain.ErrorCodeInvalidInput,
-				"relationships.show",
-				err.Error(),
-				"Run 'automain relationships show --help' for usage.",
-				err,
-			))
+		if err := parseSubcommandFlags(fs, "relationships.show", rest, "Run 'automain relationships show --help' for usage."); err != nil {
+			return writeError(stdout, stderr, jsonMode, "relationships.show", err)
 		}
 		rel, err := svc.GetRelationship(ctx, domain.RelationshipID(strings.TrimSpace(*id)))
 		if err != nil {
@@ -421,14 +380,8 @@ func runRelationships(ctx context.Context, svc *app.Service, cfg config.Config, 
 		fs := newSubFlagSet("relationships verify")
 		id := fs.String("id", "", "Relationship ID to verify")
 		unverify := fs.Bool("unverify", false, "Clear human verification flag")
-		if err := fs.Parse(rest); err != nil {
-			return writeError(stdout, stderr, jsonMode, "relationships.verify", domain.NewError(
-				domain.ErrorCodeInvalidInput,
-				"relationships.verify",
-				err.Error(),
-				"Run 'automain relationships verify --help' for usage.",
-				err,
-			))
+		if err := parseSubcommandFlags(fs, "relationships.verify", rest, "Run 'automain relationships verify --help' for usage."); err != nil {
+			return writeError(stdout, stderr, jsonMode, "relationships.verify", err)
 		}
 		rel, err := svc.VerifyRelationship(ctx, domain.RelationshipID(strings.TrimSpace(*id)), !*unverify)
 		if err != nil {
@@ -523,13 +476,110 @@ func newSubFlagSet(name string) *flag.FlagSet {
 	return fs
 }
 
+type boolFlag interface {
+	IsBoolFlag() bool
+}
+
+// parseSubcommandFlags validates that value-taking flags do not swallow subsequent flags,
+// parses fs, and rejects any leftover positional arguments.
+func parseSubcommandFlags(fs *flag.FlagSet, operation string, args []string, recovery string) error {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			continue
+		}
+		trimmed := strings.TrimLeft(arg, "-")
+		if eqIdx := strings.IndexByte(trimmed, '='); eqIdx >= 0 {
+			name := trimmed[:eqIdx]
+			val := trimmed[eqIdx+1:]
+			f := fs.Lookup(name)
+			if f == nil {
+				continue
+			}
+			if bf, ok := f.Value.(boolFlag); ok && bf.IsBoolFlag() {
+				continue
+			}
+			if strings.TrimSpace(val) == "" || (strings.HasPrefix(val, "-") && !isSignedInteger(val)) {
+				return domain.NewError(
+					domain.ErrorCodeInvalidInput,
+					operation,
+					fmt.Sprintf("Flag --%s requires a valid value, got %q.", name, val),
+					recovery,
+					nil,
+				)
+			}
+			continue
+		}
+
+		f := fs.Lookup(trimmed)
+		if f == nil {
+			continue
+		}
+		if bf, ok := f.Value.(boolFlag); ok && bf.IsBoolFlag() {
+			continue
+		}
+		if i+1 >= len(args) {
+			return domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				operation,
+				fmt.Sprintf("Flag %s requires a value.", arg),
+				recovery,
+				nil,
+			)
+		}
+		next := args[i+1]
+		if strings.TrimSpace(next) == "" || (strings.HasPrefix(next, "-") && !isSignedInteger(next)) {
+			return domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				operation,
+				fmt.Sprintf("Flag %s requires a value, got %q.", arg, next),
+				recovery,
+				nil,
+			)
+		}
+		i++
+	}
+
+	if err := fs.Parse(args); err != nil {
+		return domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			operation,
+			err.Error(),
+			recovery,
+			err,
+		)
+	}
+	if fs.NArg() > 0 {
+		return domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			operation,
+			fmt.Sprintf("Unexpected argument %q.", fs.Arg(0)),
+			recovery,
+			nil,
+		)
+	}
+	return nil
+}
+
+func isSignedInteger(s string) bool {
+	_, err := strconv.Atoi(s)
+	return err == nil
+}
+
 func detectJSONFlag(args []string) bool {
+	jsonMode := false
 	for _, a := range args {
-		if a == "--json" || a == "-json" || a == "--json=true" || a == "-json=true" {
-			return true
+		switch a {
+		case "--json", "-json", "--json=true", "-json=true":
+			jsonMode = true
+		case "--json=false", "-json=false":
+			jsonMode = false
 		}
 	}
-	return false
+	return jsonMode
 }
 
 // extractGlobalFlags strips global options (--db, --repo, --json, --timeout, --finder, --listen, --help)
@@ -555,8 +605,12 @@ func extractGlobalFlags(base config.Config, args []string) (config.Config, []str
 			}
 			cfg.DBPath = val
 			i = next
-		case strings.HasPrefix(arg, "--db="):
-			cfg.DBPath = strings.TrimPrefix(arg, "--db=")
+		case hasFlagValuePrefix(arg, "db"):
+			val, err := extractInlineValue("--db", arg)
+			if err != nil {
+				return cfg, nil, false, err
+			}
+			cfg.DBPath = val
 		case arg == "--repo" || arg == "-repo":
 			val, next, err := consumeValue("--repo", args, i)
 			if err != nil {
@@ -564,8 +618,12 @@ func extractGlobalFlags(base config.Config, args []string) (config.Config, []str
 			}
 			cfg.Repository = val
 			i = next
-		case strings.HasPrefix(arg, "--repo="):
-			cfg.Repository = strings.TrimPrefix(arg, "--repo=")
+		case hasFlagValuePrefix(arg, "repo"):
+			val, err := extractInlineValue("--repo", arg)
+			if err != nil {
+				return cfg, nil, false, err
+			}
+			cfg.Repository = val
 		case arg == "--finder" || arg == "-finder":
 			val, next, err := consumeValue("--finder", args, i)
 			if err != nil {
@@ -573,8 +631,12 @@ func extractGlobalFlags(base config.Config, args []string) (config.Config, []str
 			}
 			cfg.Finder = val
 			i = next
-		case strings.HasPrefix(arg, "--finder="):
-			cfg.Finder = strings.TrimPrefix(arg, "--finder=")
+		case hasFlagValuePrefix(arg, "finder"):
+			val, err := extractInlineValue("--finder", arg)
+			if err != nil {
+				return cfg, nil, false, err
+			}
+			cfg.Finder = val
 		case arg == "--listen" || arg == "-listen":
 			val, next, err := consumeValue("--listen", args, i)
 			if err != nil {
@@ -582,8 +644,12 @@ func extractGlobalFlags(base config.Config, args []string) (config.Config, []str
 			}
 			cfg.ListenAddr = val
 			i = next
-		case strings.HasPrefix(arg, "--listen="):
-			cfg.ListenAddr = strings.TrimPrefix(arg, "--listen=")
+		case hasFlagValuePrefix(arg, "listen"):
+			val, err := extractInlineValue("--listen", arg)
+			if err != nil {
+				return cfg, nil, false, err
+			}
+			cfg.ListenAddr = val
 		case arg == "--timeout" || arg == "-timeout":
 			val, next, err := consumeValue("--timeout", args, i)
 			if err != nil {
@@ -601,8 +667,9 @@ func extractGlobalFlags(base config.Config, args []string) (config.Config, []str
 			}
 			cfg.Timeout = dur
 			i = next
-		case strings.HasPrefix(arg, "--timeout="):
-			val := strings.TrimPrefix(arg, "--timeout=")
+		case hasFlagValuePrefix(arg, "timeout"):
+			eqIdx := strings.IndexByte(arg, '=')
+			val := arg[eqIdx+1:]
 			dur, parseErr := time.ParseDuration(val)
 			if parseErr != nil {
 				return cfg, nil, false, domain.NewError(
@@ -622,6 +689,25 @@ func extractGlobalFlags(base config.Config, args []string) (config.Config, []str
 	return cfg, remaining, helpRequested, nil
 }
 
+func hasFlagValuePrefix(arg, name string) bool {
+	return strings.HasPrefix(arg, "--"+name+"=") || strings.HasPrefix(arg, "-"+name+"=")
+}
+
+func extractInlineValue(flagName, arg string) (string, error) {
+	eqIdx := strings.IndexByte(arg, '=')
+	val := arg[eqIdx+1:]
+	if strings.TrimSpace(val) == "" || strings.HasPrefix(val, "-") {
+		return "", domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"cli",
+			fmt.Sprintf("Flag %s requires a non-empty value, got %q.", flagName, val),
+			fmt.Sprintf("Provide a valid value for %s or run 'automain --help'.", flagName),
+			nil,
+		)
+	}
+	return val, nil
+}
+
 func consumeValue(flagName string, args []string, idx int) (string, int, error) {
 	if idx+1 >= len(args) {
 		return "", idx, domain.NewError(
@@ -632,7 +718,17 @@ func consumeValue(flagName string, args []string, idx int) (string, int, error) 
 			nil,
 		)
 	}
-	return args[idx+1], idx + 1, nil
+	val := args[idx+1]
+	if strings.TrimSpace(val) == "" || (strings.HasPrefix(val, "-") && !(flagName == "--timeout" && len(val) > 1 && val[1] >= '0' && val[1] <= '9')) {
+		return "", idx, domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"cli",
+			fmt.Sprintf("Flag %s requires a value, got %q.", flagName, val),
+			fmt.Sprintf("Provide a value after %s or run 'automain --help'.", flagName),
+			nil,
+		)
+	}
+	return val, idx + 1, nil
 }
 
 func writeMainUsage(w io.Writer) {

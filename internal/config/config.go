@@ -87,6 +87,15 @@ func (c Config) Validate(operation string) error {
 			nil,
 		)
 	}
+	if strings.TrimSpace(c.ListenAddr) == "" {
+		return domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			operation,
+			"Listen address (--listen or AUTOMAIN_LISTEN_ADDR) must not be empty.",
+			"Pass --listen 127.0.0.1:8080 or set AUTOMAIN_LISTEN_ADDR.",
+			nil,
+		)
+	}
 	if c.Timeout <= 0 {
 		return domain.NewError(
 			domain.ErrorCodeInvalidInput,

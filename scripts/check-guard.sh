@@ -13,7 +13,7 @@ trap 'exit 1' HUP INT TERM
 git diff --cached --name-only | while IFS= read -r staged_path; do
     [ -n "$staged_path" ] || continue
     case "$staged_path" in
-        docs/*|work-orders/*|AGENTS.md|agents.md|WATCHDOG.md|watchdog.md|ADVISOR.md|advisor.md|CLAUDE.md|claude.md|GEMINI.md|gemini.md|.agent/*|.agents/*|.claude/*|.cursor/*|.gemini/*)
+        docs/*|work-orders/*|AGENTS.md|agents.md|*/AGENTS.md|*/agents.md|WATCHDOG.md|watchdog.md|*/WATCHDOG.md|*/watchdog.md|ADVISOR.md|advisor.md|*/ADVISOR.md|*/advisor.md|CLAUDE.md|claude.md|*/CLAUDE.md|*/claude.md|GEMINI.md|gemini.md|*/GEMINI.md|*/gemini.md|*.agent.md|*.instructions.md|*.prompt.md|.agent/*|.agents/*|.claude/*|.cursor/*|.gemini/*)
             printf '%s\tforbidden staged doc or agent file\n' "$staged_path" >> "$tmp/violations"
             ;;
     esac
@@ -26,44 +26,83 @@ git ls-files --cached --others --exclude-standard -z '*_test.go' | xargs -0 -I{}
     printf "%s\tforbidden permanent test file (DEV-05)\n" "$file"
 ' sh {} >> "$tmp/violations"
 
-# 3. Inspect Go sources for forbidden escape hatches (DEV-03: //nolint, unsafe, panic)
+# 3. Inspect Go sources for forbidden escape hatches (DEV-03: //nolint, /*nolint*/, unsafe, panic)
 cat > "$tmp/go_guard.awk" <<'AWK'
 BEGIN {
     path = ENVIRON["GUARD_PATH"]
+    nolint_reported = 0
 }
 {
-    if ($0 ~ /\/\/[[:space:]]*nolint/) {
-        print path ":" NR "\tforbidden linter suppression (//nolint)"
-    }
     text = text $0 "\n"
 }
 END {
-    source = text
-    # Strip raw string literals (`...`)
-    gsub(/`[^`]*`/, "\"\"", source)
-    # Strip rune literals
-    gsub(/'(\\.|[^'\\])*'/, "''", source)
-    # Strip interpreted string literals ("...")
-    gsub(/"([^"\\]|\\.)*"/, "\"\"", source)
-    # Strip block comments (/* ... */)
-    while (match(source, /\/\*/)) {
-        start_pos = RSTART
-        rest = substr(source, start_pos + 2)
-        end_idx = index(rest, "*/")
-        if (end_idx > 0) {
-            source = substr(source, 1, start_pos - 1) " " substr(rest, end_idx + 2)
-        } else {
-            source = substr(source, 1, start_pos - 1)
+    rest = text
+    code = ""
+
+    # Single-pass left-to-right lexical scanner over comments, strings, raw strings, and runes.
+    while (length(rest) > 0) {
+        if (!match(rest, /(\/\/[^\n]*|\/\*|"([^"\\]|\\.)*"|`[^`]*`|'([^'\\]|\\.)*')/)) {
+            code = code rest
             break
         }
-    }
-    # Strip line comments (// ...)
-    gsub(/\/\/[^\n]*/, "", source)
 
-    if (source ~ /(^|[^a-zA-Z0-9_])unsafe([^a-zA-Z0-9_]|$)/) {
+        tok_start = RSTART
+        tok_len = RLENGTH
+        if (tok_start > 1) {
+            code = code substr(rest, 1, tok_start - 1)
+        }
+        tok = substr(rest, tok_start, tok_len)
+        prefix2 = substr(tok, 1, 2)
+
+        if (prefix2 == "//") {
+            body = substr(tok, 3)
+            if (!nolint_reported && body ~ /^[[:space:]]*nolint([^a-zA-Z0-9_]|$)/) {
+                print path "\tforbidden linter suppression (//nolint)"
+                nolint_reported = 1
+            }
+            code = code "\n"
+            rest = substr(rest, tok_start + tok_len)
+        } else if (prefix2 == "/*") {
+            after_open = substr(rest, tok_start + 2)
+            close_idx = index(after_open, "*/")
+            if (close_idx > 0) {
+                body = substr(after_open, 1, close_idx - 1)
+                if (!nolint_reported && body ~ /(^|[[:space:]])nolint([^a-zA-Z0-9_]|$)/) {
+                    print path "\tforbidden linter suppression (/*nolint*/)"
+                    nolint_reported = 1
+                }
+                code = code " "
+                rest = substr(after_open, close_idx + 2)
+            } else {
+                body = after_open
+                if (!nolint_reported && body ~ /(^|[[:space:]])nolint([^a-zA-Z0-9_]|$)/) {
+                    print path "\tforbidden linter suppression (/*nolint*/)"
+                    nolint_reported = 1
+                }
+                break
+            }
+        } else {
+            quote_char = substr(tok, 1, 1)
+            if (quote_char == "\"" || quote_char == "`") {
+                inner = substr(tok, 2, tok_len - 2)
+                if (inner == "unsafe") {
+                    code = code "\"unsafe\""
+                } else {
+                    code = code "\"\""
+                }
+            } else {
+                code = code "''"
+            }
+            rest = substr(rest, tok_start + tok_len)
+        }
+    }
+
+    if (code ~ /(^|[^a-zA-Z0-9_"])unsafe([^a-zA-Z0-9_"]|$)/ ||
+        code ~ /(^|[^a-zA-Z0-9_])import[[:space:]]+(([a-zA-Z_][a-zA-Z0-9_]*|\.)[[:space:]]+)?"unsafe"/ ||
+        code ~ /(^|[^a-zA-Z0-9_])import[[:space:]]*\([^)]*"unsafe"[^)]*\)/) {
         print path "\tforbidden unsafe usage (DEV-03)"
     }
-    if (source ~ /(^|[^a-zA-Z0-9_])panic[[:space:]]*\(/) {
+    if (code ~ /(^|[^a-zA-Z0-9_])panic[[:space:]]*\(/) {
         print path "\tforbidden panic call (DEV-03)"
     }
 }
@@ -90,8 +129,12 @@ check_dashes() {
     fi
 }
 
-for doc_file in $(git ls-files --cached --others --exclude-standard) AGENTS.md WATCHDOG.md CLAUDE.md; do
+git ls-files --cached --others --exclude-standard | while IFS= read -r doc_file; do
     check_dashes "$doc_file"
+done
+
+for root_agent_doc in AGENTS.md WATCHDOG.md CLAUDE.md ADVISOR.md GEMINI.md; do
+    check_dashes "$root_agent_doc"
 done
 
 if [ -d docs ]; then
