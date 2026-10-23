@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS threads (
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'resolved', 'stale')),
     revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
     created_at TEXT DEFAULT '',
-    updated_at TEXT DEFAULT ''
+    updated_at TEXT DEFAULT '',
+    UNIQUE (repo, id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_threads_repo_status_updated
@@ -98,7 +99,7 @@ CREATE TABLE IF NOT EXISTS relationships (
     created_at TEXT DEFAULT '',
     updated_at TEXT DEFAULT '',
     UNIQUE (repo, thread_id, item_number, rel_type),
-    FOREIGN KEY (thread_id) REFERENCES threads (id) ON DELETE CASCADE,
+    FOREIGN KEY (repo, thread_id) REFERENCES threads (repo, id) ON DELETE CASCADE,
     FOREIGN KEY (repo, item_number) REFERENCES items (repo, number) ON DELETE CASCADE
 );
 
@@ -130,17 +131,23 @@ CREATE INDEX IF NOT EXISTS idx_relationship_evidence_rel_id
 }
 
 func migrate(ctx context.Context, db *sql.DB) (int, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin migration transaction: %w", err)
+	}
+	defer rollbackTx(tx)
+
 	const createTableSQL = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL
 );`
-	if _, err := db.ExecContext(ctx, createTableSQL); err != nil {
+	if _, err := tx.ExecContext(ctx, createTableSQL); err != nil {
 		return 0, fmt.Errorf("create schema_migrations table: %w", err)
 	}
 
 	var currentVersion int
-	row := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations")
+	row := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations")
 	if err := row.Scan(&currentVersion); err != nil {
 		return 0, fmt.Errorf("read current schema version: %w", err)
 	}
@@ -150,13 +157,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		if m.version <= currentVersion {
 			continue
 		}
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			return currentVersion, fmt.Errorf("begin migration v%d transaction: %w", m.version, err)
-		}
-
 		if _, err := tx.ExecContext(ctx, m.sql); err != nil {
-			rollbackTx(tx)
 			return currentVersion, fmt.Errorf("execute migration v%d: %w", m.version, err)
 		}
 
@@ -166,15 +167,13 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 			m.version,
 			now,
 		); err != nil {
-			rollbackTx(tx)
 			return currentVersion, fmt.Errorf("record migration v%d: %w", m.version, err)
 		}
-
-		if err := tx.Commit(); err != nil {
-			rollbackTx(tx)
-			return currentVersion, fmt.Errorf("commit migration v%d: %w", m.version, err)
-		}
 		currentVersion = m.version
+	}
+
+	if err := tx.Commit(); err != nil {
+		return currentVersion, fmt.Errorf("commit schema migrations: %w", err)
 	}
 
 	return currentVersion, nil

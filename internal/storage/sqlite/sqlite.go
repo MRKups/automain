@@ -65,7 +65,7 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 
 	dsn := cleanPath
 	if !strings.Contains(cleanPath, "?") {
-		dsn = cleanPath + "?_busy_timeout=5000&_foreign_keys=1&_journal_mode=WAL&_synchronous=NORMAL"
+		dsn = cleanPath + "?_busy_timeout=5000&_foreign_keys=1&_txlock=immediate"
 	}
 
 	db, err := sql.Open("sqlite", dsn)
@@ -143,11 +143,33 @@ func applyPragmas(ctx context.Context, db *sql.DB) error {
 		"PRAGMA foreign_keys = ON;",
 	}
 	for _, stmt := range pragmas {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if err := execPragma(ctx, db, stmt); err != nil {
 			return fmt.Errorf("exec %q: %w", stmt, err)
 		}
 	}
 	return nil
+}
+
+func execPragma(ctx context.Context, db *sql.DB, stmt string) error {
+	const retryInterval = 5 * time.Millisecond
+	const maxWait = 5 * time.Second
+	deadline := time.Now().Add(maxWait)
+	for {
+		_, err := db.ExecContext(ctx, stmt)
+		if err == nil {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "SQLITE_BUSY") || time.Now().After(deadline) {
+			return err
+		}
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func closeDB(db *sql.DB) {

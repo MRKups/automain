@@ -99,6 +99,7 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 	}
 
 	normalizedItems := make([]domain.Item, len(batch.Items))
+	seenItems := make(map[int]struct{}, len(batch.Items))
 	for i, item := range batch.Items {
 		if strings.TrimSpace(item.Repository) == "" {
 			item.Repository = repo
@@ -121,10 +122,22 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 				err,
 			)
 		}
+		if _, exists := seenItems[item.Number]; exists {
+			return domain.SyncResult{}, domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"storage.upsert_batch",
+				fmt.Sprintf("Duplicate item #%d in sync batch for %q.", item.Number, repo),
+				"Deduplicate items by number before calling UpsertItemsBatch.",
+				nil,
+			)
+		}
+		seenItems[item.Number] = struct{}{}
+		item.LastAnalyzedHash = ""
 		normalizedItems[i] = item
 	}
 
 	normalizedComments := make([]domain.Comment, len(batch.Comments))
+	seenComments := make(map[string]struct{}, len(batch.Comments))
 	for i, c := range batch.Comments {
 		if strings.TrimSpace(c.Repository) == "" {
 			c.Repository = repo
@@ -147,7 +160,8 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 				nil,
 			)
 		}
-		if strings.TrimSpace(c.CommentID) == "" {
+		trimmedCommentID := strings.TrimSpace(c.CommentID)
+		if trimmedCommentID == "" {
 			return domain.SyncResult{}, domain.NewError(
 				domain.ErrorCodeInvalidInput,
 				"storage.upsert_batch",
@@ -156,6 +170,17 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 				nil,
 			)
 		}
+		if _, exists := seenComments[trimmedCommentID]; exists {
+			return domain.SyncResult{}, domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"storage.upsert_batch",
+				fmt.Sprintf("Duplicate comment %q in sync batch for %q.", trimmedCommentID, repo),
+				"Deduplicate comments by comment_id before calling UpsertItemsBatch.",
+				nil,
+			)
+		}
+		seenComments[trimmedCommentID] = struct{}{}
+		c.CommentID = trimmedCommentID
 		normalizedComments[i] = c
 	}
 
@@ -173,13 +198,13 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 			return domain.SyncResult{}, err
 		}
 
-		var existingContentHash, existingAnalyzedHash string
+		var existingContentHash string
 		qErr := tx.QueryRowContext(
 			ctx,
-			"SELECT content_hash, COALESCE(last_analyzed_hash, '') FROM items WHERE repo = ? AND number = ?",
+			"SELECT content_hash FROM items WHERE repo = ? AND number = ?",
 			repo,
 			item.Number,
-		).Scan(&existingContentHash, &existingAnalyzedHash)
+		).Scan(&existingContentHash)
 
 		if errors.Is(qErr, sql.ErrNoRows) {
 			newItems++
@@ -188,7 +213,7 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 				`INSERT INTO items (
 					repo, number, external_id, kind, state, title, body, author,
 					labels_json, url, created_at, updated_at, content_hash, last_analyzed_hash
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')`,
 				repo,
 				item.Number,
 				item.ExternalID,
@@ -202,7 +227,6 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 				formatTime(item.CreatedAt),
 				formatTime(item.UpdatedAt),
 				item.ContentHash,
-				item.LastAnalyzedHash,
 			); err != nil {
 				return domain.SyncResult{}, fmt.Errorf("insert item %s#%d: %w", repo, item.Number, err)
 			}
@@ -212,10 +236,6 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 			return domain.SyncResult{}, fmt.Errorf("inspect existing item %s#%d: %w", repo, item.Number, qErr)
 		}
 
-		analyzedHashToStore := existingAnalyzedHash
-		if item.LastAnalyzedHash != "" {
-			analyzedHashToStore = item.LastAnalyzedHash
-		}
 		if existingContentHash == item.ContentHash {
 			unchangedItems++
 		} else {
@@ -235,8 +255,7 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 				url = ?,
 				created_at = ?,
 				updated_at = ?,
-				content_hash = ?,
-				last_analyzed_hash = ?
+				content_hash = ?
 			WHERE repo = ? AND number = ?`,
 			item.ExternalID,
 			string(item.Kind),
@@ -249,7 +268,6 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 			formatTime(item.CreatedAt),
 			formatTime(item.UpdatedAt),
 			item.ContentHash,
-			analyzedHashToStore,
 			repo,
 			item.Number,
 		); err != nil {

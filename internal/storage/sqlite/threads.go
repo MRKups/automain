@@ -17,7 +17,7 @@ const threadSelectColumns = `
 	t.title,
 	t.summary,
 	t.status,
-	(SELECT COUNT(DISTINCT r.item_number) FROM relationships r WHERE r.thread_id = t.id) AS item_count,
+	(SELECT COUNT(DISTINCT r.item_number) FROM relationships r WHERE r.thread_id = t.id AND r.repo = t.repo) AS item_count,
 	t.revision,
 	COALESCE(t.created_at, ''),
 	COALESCE(t.updated_at, '')
@@ -92,13 +92,14 @@ func (s *Store) UpdateThread(ctx context.Context, thread domain.Thread) error {
 			status = ?,
 			revision = ?,
 			updated_at = ?
-		WHERE id = ?`,
+		WHERE id = ? AND repo = ?`,
 		thread.Title,
 		thread.Summary,
 		string(thread.Status),
 		thread.Revision,
 		formatTime(thread.UpdatedAt),
 		string(thread.ID),
+		thread.Repository,
 	)
 	if err != nil {
 		return fmt.Errorf("update thread %q: %w", thread.ID, err)
@@ -108,12 +109,26 @@ func (s *Store) UpdateThread(ctx context.Context, thread domain.Thread) error {
 		return fmt.Errorf("rows affected updating thread %q: %w", thread.ID, err)
 	}
 	if affected == 0 {
+		var existingRepo string
+		qErr := s.db.QueryRowContext(ctx, "SELECT repo FROM threads WHERE id = ?", string(thread.ID)).Scan(&existingRepo)
+		if errors.Is(qErr, sql.ErrNoRows) {
+			return domain.NewError(
+				domain.ErrorCodeNotFound,
+				"threads.update",
+				fmt.Sprintf("Thread %q was not found.", thread.ID),
+				"Run 'automain threads list --repo <owner/name>' to inspect existing thread IDs.",
+				qErr,
+			)
+		}
+		if qErr != nil {
+			return fmt.Errorf("lookup thread %q repository: %w", thread.ID, qErr)
+		}
 		return domain.NewError(
-			domain.ErrorCodeNotFound,
+			domain.ErrorCodeInvalidInput,
 			"threads.update",
-			fmt.Sprintf("Thread %q was not found.", thread.ID),
-			"Run 'automain threads list --repo <owner/name>' to inspect existing thread IDs.",
-			sql.ErrNoRows,
+			fmt.Sprintf("Thread %q belongs to repository %q, not %q.", thread.ID, existingRepo, thread.Repository),
+			"Ensure the thread repository matches its stored repository.",
+			nil,
 		)
 	}
 	return nil
@@ -309,7 +324,11 @@ func (s *Store) SaveItemAnalysis(ctx context.Context, record domain.ItemAnalysis
 	}
 
 	now := time.Now().UTC()
+	seenThreadIDs := make(map[domain.ThreadID]struct{}, len(record.ThreadsToCreate)+len(record.ThreadsToUpdate))
 	for i := range record.ThreadsToCreate {
+		if strings.TrimSpace(record.ThreadsToCreate[i].Repository) == "" {
+			record.ThreadsToCreate[i].Repository = record.Repository
+		}
 		if record.ThreadsToCreate[i].Revision <= 0 {
 			record.ThreadsToCreate[i].Revision = 1
 		}
@@ -328,8 +347,30 @@ func (s *Store) SaveItemAnalysis(ctx context.Context, record domain.ItemAnalysis
 				err,
 			)
 		}
+		if record.ThreadsToCreate[i].Repository != record.Repository {
+			return domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"storage.save_analysis",
+				fmt.Sprintf("New thread %q repository %q does not match analyzed item repository %q.", record.ThreadsToCreate[i].ID, record.ThreadsToCreate[i].Repository, record.Repository),
+				"Ensure all created threads belong to the analyzed item's repository.",
+				nil,
+			)
+		}
+		if _, exists := seenThreadIDs[record.ThreadsToCreate[i].ID]; exists {
+			return domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"storage.save_analysis",
+				fmt.Sprintf("Duplicate thread %q in analysis record for %s#%d.", record.ThreadsToCreate[i].ID, record.Repository, record.ItemNumber),
+				"Ensure each thread ID appears at most once per item analysis record.",
+				nil,
+			)
+		}
+		seenThreadIDs[record.ThreadsToCreate[i].ID] = struct{}{}
 	}
 	for i := range record.ThreadsToUpdate {
+		if strings.TrimSpace(record.ThreadsToUpdate[i].Repository) == "" {
+			record.ThreadsToUpdate[i].Repository = record.Repository
+		}
 		if record.ThreadsToUpdate[i].UpdatedAt.IsZero() {
 			record.ThreadsToUpdate[i].UpdatedAt = now
 		}
@@ -342,8 +383,30 @@ func (s *Store) SaveItemAnalysis(ctx context.Context, record domain.ItemAnalysis
 				err,
 			)
 		}
+		if record.ThreadsToUpdate[i].Repository != record.Repository {
+			return domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"storage.save_analysis",
+				fmt.Sprintf("Updated thread %q repository %q does not match analyzed item repository %q.", record.ThreadsToUpdate[i].ID, record.ThreadsToUpdate[i].Repository, record.Repository),
+				"Ensure all updated threads belong to the analyzed item's repository.",
+				nil,
+			)
+		}
+		if _, exists := seenThreadIDs[record.ThreadsToUpdate[i].ID]; exists {
+			return domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"storage.save_analysis",
+				fmt.Sprintf("Duplicate thread %q in analysis record for %s#%d.", record.ThreadsToUpdate[i].ID, record.Repository, record.ItemNumber),
+				"Ensure each thread ID appears at most once per item analysis record.",
+				nil,
+			)
+		}
+		seenThreadIDs[record.ThreadsToUpdate[i].ID] = struct{}{}
 	}
 	for i := range record.Relationships {
+		if strings.TrimSpace(record.Relationships[i].Repository) == "" {
+			record.Relationships[i].Repository = record.Repository
+		}
 		if record.Relationships[i].CreatedAt.IsZero() {
 			record.Relationships[i].CreatedAt = now
 		}
@@ -359,6 +422,24 @@ func (s *Store) SaveItemAnalysis(ctx context.Context, record domain.ItemAnalysis
 				err,
 			)
 		}
+		if record.Relationships[i].Repository != record.Repository {
+			return domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"storage.save_analysis",
+				fmt.Sprintf("Relationship %q repository %q does not match analyzed item repository %q.", record.Relationships[i].ID, record.Relationships[i].Repository, record.Repository),
+				"Ensure all relationships in an item analysis record belong to the analyzed item's repository.",
+				nil,
+			)
+		}
+		if record.Relationships[i].ItemNumber != record.ItemNumber {
+			return domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"storage.save_analysis",
+				fmt.Sprintf("Relationship %q item_number %d does not match analyzed item %s#%d.", record.Relationships[i].ID, record.Relationships[i].ItemNumber, record.Repository, record.ItemNumber),
+				"Ensure all relationships in an item analysis record belong to the analyzed item.",
+				nil,
+			)
+		}
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -366,65 +447,6 @@ func (s *Store) SaveItemAnalysis(ctx context.Context, record domain.ItemAnalysis
 		return fmt.Errorf("begin save analysis transaction: %w", err)
 	}
 	defer rollbackTx(tx)
-
-	for _, t := range record.ThreadsToCreate {
-		if _, err := tx.ExecContext(
-			ctx,
-			`INSERT INTO threads (id, repo, title, summary, status, revision, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			string(t.ID),
-			t.Repository,
-			t.Title,
-			t.Summary,
-			string(t.Status),
-			t.Revision,
-			formatTime(t.CreatedAt),
-			formatTime(t.UpdatedAt),
-		); err != nil {
-			return fmt.Errorf("insert thread %q during analysis save: %w", t.ID, err)
-		}
-	}
-
-	for _, t := range record.ThreadsToUpdate {
-		res, err := tx.ExecContext(
-			ctx,
-			`UPDATE threads SET
-				title = ?,
-				summary = ?,
-				status = ?,
-				revision = ?,
-				updated_at = ?
-			WHERE id = ?`,
-			t.Title,
-			t.Summary,
-			string(t.Status),
-			t.Revision,
-			formatTime(t.UpdatedAt),
-			string(t.ID),
-		)
-		if err != nil {
-			return fmt.Errorf("update thread %q during analysis save: %w", t.ID, err)
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("rows affected updating thread %q: %w", t.ID, err)
-		}
-		if affected == 0 {
-			return domain.NewError(
-				domain.ErrorCodeNotFound,
-				"storage.save_analysis",
-				fmt.Sprintf("Thread %q to update was not found.", t.ID),
-				"Verify candidate thread IDs exist in SQLite.",
-				sql.ErrNoRows,
-			)
-		}
-	}
-
-	for _, rel := range record.Relationships {
-		if err := upsertRelationshipTx(ctx, tx, rel); err != nil {
-			return err
-		}
-	}
 
 	res, err := tx.ExecContext(
 		ctx,
@@ -448,6 +470,80 @@ func (s *Store) SaveItemAnalysis(ctx context.Context, record domain.ItemAnalysis
 			fmt.Sprintf("Run 'automain sync --repo %s' before analyzing items.", record.Repository),
 			sql.ErrNoRows,
 		)
+	}
+
+	for _, t := range record.ThreadsToCreate {
+		if _, err := tx.ExecContext(
+			ctx,
+			`INSERT INTO threads (id, repo, title, summary, status, revision, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			string(t.ID),
+			t.Repository,
+			t.Title,
+			t.Summary,
+			string(t.Status),
+			t.Revision,
+			formatTime(t.CreatedAt),
+			formatTime(t.UpdatedAt),
+		); err != nil {
+			return fmt.Errorf("insert thread %q during analysis save: %w", t.ID, err)
+		}
+	}
+
+	for _, t := range record.ThreadsToUpdate {
+		uRes, err := tx.ExecContext(
+			ctx,
+			`UPDATE threads SET
+				title = ?,
+				summary = ?,
+				status = ?,
+				revision = ?,
+				updated_at = ?
+			WHERE id = ? AND repo = ?`,
+			t.Title,
+			t.Summary,
+			string(t.Status),
+			t.Revision,
+			formatTime(t.UpdatedAt),
+			string(t.ID),
+			t.Repository,
+		)
+		if err != nil {
+			return fmt.Errorf("update thread %q during analysis save: %w", t.ID, err)
+		}
+		uAffected, err := uRes.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("rows affected updating thread %q: %w", t.ID, err)
+		}
+		if uAffected == 0 {
+			var existingRepo string
+			qErr := tx.QueryRowContext(ctx, "SELECT repo FROM threads WHERE id = ?", string(t.ID)).Scan(&existingRepo)
+			if errors.Is(qErr, sql.ErrNoRows) {
+				return domain.NewError(
+					domain.ErrorCodeNotFound,
+					"storage.save_analysis",
+					fmt.Sprintf("Thread %q to update was not found.", t.ID),
+					"Verify candidate thread IDs exist in SQLite.",
+					qErr,
+				)
+			}
+			if qErr != nil {
+				return fmt.Errorf("lookup thread %q repository during analysis save: %w", t.ID, qErr)
+			}
+			return domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"storage.save_analysis",
+				fmt.Sprintf("Thread %q belongs to repository %q, not %q.", t.ID, existingRepo, t.Repository),
+				"Ensure candidate threads belong to the analyzed item's repository.",
+				nil,
+			)
+		}
+	}
+
+	for _, rel := range record.Relationships {
+		if err := upsertRelationshipTx(ctx, tx, rel); err != nil {
+			return err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

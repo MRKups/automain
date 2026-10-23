@@ -63,6 +63,33 @@ func (s *Store) UpsertRelationship(ctx context.Context, rel domain.Relationship)
 }
 
 func upsertRelationshipTx(ctx context.Context, tx *sql.Tx, rel domain.Relationship) error {
+	var threadRepo string
+	if err := tx.QueryRowContext(
+		ctx,
+		"SELECT repo FROM threads WHERE id = ?",
+		string(rel.ThreadID),
+	).Scan(&threadRepo); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.NewError(
+				domain.ErrorCodeNotFound,
+				"relationships.upsert",
+				fmt.Sprintf("Thread %q for relationship %q was not found.", rel.ThreadID, rel.ID),
+				"Create the thread before linking relationships to it.",
+				err,
+			)
+		}
+		return fmt.Errorf("lookup thread %q for relationship %q: %w", rel.ThreadID, rel.ID, err)
+	}
+	if threadRepo != rel.Repository {
+		return domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"relationships.upsert",
+			fmt.Sprintf("Relationship %q repository %q does not match thread %q repository %q.", rel.ID, rel.Repository, rel.ThreadID, threadRepo),
+			"Ensure the relationship and its target thread belong to the same repository.",
+			nil,
+		)
+	}
+
 	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO relationships (
