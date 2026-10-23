@@ -1,0 +1,70 @@
+version: "3"
+
+vars:
+  BINARY_DIR: '{{.ROOT_DIR}}/bin'
+  BINARY: '{{.ROOT_DIR}}/bin/automain'
+  _AUTOMAIN_ARGS: '{{.CLI_ARGS}}'
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the automain single binary into bin/automain
+    cmds:
+      - mkdir -p {{.BINARY_DIR | q}}
+      - go build -o {{.BINARY | q}} ./cmd/automain
+
+  fmt:
+    desc: Format all Go source files
+    cmds:
+      - gofmt -w .
+
+  guard:
+    desc: Enforce DEV-03, DEV-05, prose, and gitignore safety checks
+    cmds:
+      - sh scripts/check-guard.sh
+
+  lint:
+    desc: Run source guard, gofmt check, and go vet
+    cmds:
+      - task: guard
+      - |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          printf 'error: unformatted Go files:\n%s\n' "$unformatted" >&2
+          exit 1
+        fi
+      - go vet ./...
+
+  check:
+    desc: Run all static checks and verify workspace build
+    cmds:
+      - task: lint
+      - go build ./...
+
+  dev:
+    desc: Run automain with isolated persistent state in ~/.automain-dev
+    cmds:
+      - |
+        sh -eu -c '
+          umask 077
+          DEV_ROOT="$HOME/.automain-dev"
+          mkdir -p "$DEV_ROOT"
+          export AUTOMAIN_DB_PATH="$DEV_ROOT/automain.db"
+          exec go run ./cmd/automain "$@"
+        ' automain-dev {{._AUTOMAIN_ARGS}}
+
+  sandbox:
+    desc: Run automain in a disposable temporary directory in /tmp
+    cmds:
+      - |
+        sh -eu -c '
+          umask 077
+          SANDBOX_ROOT=$(mktemp -d /tmp/automain-sandbox.XXXXXX)
+          trap "rm -rf \"\$SANDBOX_ROOT\"" 0 HUP INT TERM
+          export AUTOMAIN_DB_PATH="$SANDBOX_ROOT/automain.db"
+          go run ./cmd/automain "$@"
+        ' automain-sandbox {{._AUTOMAIN_ARGS}}

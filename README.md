@@ -6,16 +6,44 @@ persistent threads backed by source evidence.
 
 ## Status
 
-Pre-implementation scaffold. Only repository configuration is committed on
-`main`. Core domain packages, SQLite persistence, GitHub ingestion, relationship
-analysis, CLI commands, HTTP endpoints, and the embedded Svelte interface are
-not implemented yet.
+Core domain contracts (`internal/domain`), runtime configuration
+(`internal/config`), application service facade (`internal/app`), embedded web
+asset boundary (`web`), and the `automain` CLI router (`cmd/automain`,
+`internal/cli`) are implemented. SQLite storage, GitHub ingestion, relationship
+analysis, HTTP endpoints, and the Svelte UI are not wired yet.
 
 ## Stack
 
 - **Backend and CLI:** Go
 - **Storage:** SQLite
 - **Web UI:** Svelte (embedded into the Go binary)
+
+## Build and Run
+
+Prerequisites: Go 1.24+ and [Task](https://taskfile.dev).
+
+```sh
+# Build bin/automain
+task build
+
+# Run static guard, formatting, vet, and compilation checks
+task check
+
+# Run in a disposable /tmp sandbox
+task sandbox -- status --json
+```
+
+### CLI Commands
+
+```sh
+automain status [--db <path>] [--repo <owner/name>] [--json]
+automain sync --repo <owner/name> [--limit <n>] [--since <RFC3339>] [--full] [--json]
+automain analyze --repo <owner/name> [--item <number>] [--limit <n>] [--reanalyze] [--json]
+automain threads [list|show] [--repo <owner/name>] [--id <thread-id>] [--json]
+automain relationships [list|show|verify] [--repo <owner/name>] [--id <rel-id>] [--json]
+automain stats --repo <owner/name> [--json]
+automain serve [--listen <host:port>] [--db <path>]
+```
 
 ## Core Concepts
 
