@@ -53,6 +53,15 @@ type AnalyzeResult struct {
 	RemainingDirtyItems   int    `json:"remaining_dirty_items"`
 }
 
+// ItemFilter scopes item listing queries.
+type ItemFilter struct {
+	Repository string    `json:"repository"`
+	Kind       ItemKind  `json:"kind,omitempty"`
+	State      ItemState `json:"state,omitempty"`
+	DirtyOnly  bool      `json:"dirty_only,omitempty"`
+	Limit      int       `json:"limit,omitempty"`
+}
+
 // ThreadFilter scopes thread listing queries.
 type ThreadFilter struct {
 	Repository string       `json:"repository"`
@@ -102,17 +111,34 @@ type AnalysisDecision struct {
 	NewThreads     []NewThreadProposal `json:"new_threads"`
 }
 
+// ItemAnalysisRecord bundles the thread and relationship mutations produced by analyzing one item.
+type ItemAnalysisRecord struct {
+	Repository      string         `json:"repository"`
+	ItemNumber      int            `json:"item_number"`
+	AnalyzedHash    string         `json:"analyzed_hash"`
+	ThreadsToCreate []Thread       `json:"threads_to_create,omitempty"`
+	ThreadsToUpdate []Thread       `json:"threads_to_update,omitempty"`
+	Relationships   []Relationship `json:"relationships,omitempty"`
+}
+
 // Store is the persistence port implemented by the SQLite storage adapter.
 type Store interface {
+	SchemaVersion() int
 	GetSyncWatermark(ctx context.Context, repo string) (SyncWatermark, error)
 	UpsertItemsBatch(ctx context.Context, repo string, batch FetchBatch, syncedAt time.Time) (SyncResult, error)
-	ListDirtyItems(ctx context.Context, repo string, limit int) ([]Item, error)
+	GetItem(ctx context.Context, repo string, number int) (Item, error)
 	GetItemWithComments(ctx context.Context, repo string, number int) (Item, []Comment, error)
+	ListItems(ctx context.Context, filter ItemFilter) ([]Item, error)
+	ListDirtyItems(ctx context.Context, repo string, limit int) ([]Item, error)
+	CreateThread(ctx context.Context, thread Thread) error
+	UpdateThread(ctx context.Context, thread Thread) error
 	ListThreads(ctx context.Context, filter ThreadFilter) ([]Thread, error)
 	GetThreadDetail(ctx context.Context, id ThreadID) (ThreadDetail, error)
+	UpsertRelationship(ctx context.Context, rel Relationship) error
 	ListRelationships(ctx context.Context, filter RelationshipFilter) ([]Relationship, error)
 	GetRelationship(ctx context.Context, id RelationshipID) (Relationship, error)
 	VerifyRelationship(ctx context.Context, id RelationshipID, verified bool) (Relationship, error)
+	SaveItemAnalysis(ctx context.Context, record ItemAnalysisRecord) error
 	GetRepoStats(ctx context.Context, repo string) (RepoStats, error)
 	Close() error
 }

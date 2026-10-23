@@ -15,7 +15,7 @@ import (
 )
 
 // ServiceFactory builds the application Service once configuration and flags are resolved.
-type ServiceFactory func(cfg config.Config) (*app.Service, func(), error)
+type ServiceFactory func(ctx context.Context, cfg config.Config) (*app.Service, func(), error)
 
 // Execute parses CLI arguments, runs the requested subcommand, and returns the process exit code.
 func Execute(ctx context.Context, args []string, baseCfg config.Config, factory ServiceFactory, stdout, stderr io.Writer) int {
@@ -56,14 +56,6 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 	cmdCtx, cancel := context.WithTimeout(ctx, globalCfg.Timeout)
 	defer cancel()
 
-	svc, cleanup, err := factory(globalCfg)
-	if err != nil {
-		return writeError(stdout, stderr, jsonRequested, subcmd, err)
-	}
-	if cleanup != nil {
-		defer cleanup()
-	}
-
 	switch subcmd {
 	case "version":
 		if helpRequested {
@@ -89,19 +81,19 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 		return 0
 
 	case "status":
-		return runStatus(cmdCtx, svc, subArgs, jsonRequested, helpRequested, stdout, stderr)
+		return runStatus(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "sync":
-		return runSync(cmdCtx, svc, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+		return runSync(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "analyze":
-		return runAnalyze(cmdCtx, svc, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+		return runAnalyze(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "threads":
-		return runThreads(cmdCtx, svc, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+		return runThreads(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "relationships":
-		return runRelationships(cmdCtx, svc, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+		return runRelationships(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "stats":
-		return runStats(cmdCtx, svc, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+		return runStats(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "serve":
-		return runServe(cmdCtx, svc, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+		return runServe(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	default:
 		return writeError(stdout, stderr, jsonRequested, subcmd, domain.NewError(
 			domain.ErrorCodeInvalidInput,
@@ -113,7 +105,7 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 	}
 }
 
-func runStatus(ctx context.Context, svc *app.Service, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
+func runStatus(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
 	if helpRequested {
 		fmt.Fprintln(stdout, "Usage: automain status [--db <path>] [--repo <owner/name>] [--json]")
 		return 0
@@ -127,6 +119,14 @@ func runStatus(ctx context.Context, svc *app.Service, args []string, jsonMode, h
 			nil,
 		))
 	}
+	svc, cleanup, err := factory(ctx, cfg)
+	if err != nil {
+		return writeError(stdout, stderr, jsonMode, "status", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
 	rep, err := svc.Status(ctx)
 	if err != nil {
 		return writeError(stdout, stderr, jsonMode, "status", err)
@@ -141,7 +141,7 @@ func runStatus(ctx context.Context, svc *app.Service, args []string, jsonMode, h
 	return 0
 }
 
-func runSync(ctx context.Context, svc *app.Service, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
+func runSync(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
 	if helpRequested {
 		fmt.Fprintln(stdout, "Usage: automain sync --repo <owner/name> [--limit <n>] [--since <RFC3339>] [--full] [--json]")
 		return 0
@@ -168,6 +168,26 @@ func runSync(ctx context.Context, svc *app.Service, cfg config.Config, args []st
 		}
 		since = &parsed
 	}
+	if err := validateCLIRequiredRepo("sync", cfg.Repository); err != nil {
+		return writeError(stdout, stderr, jsonMode, "sync", err)
+	}
+	if *limit < 0 {
+		return writeError(stdout, stderr, jsonMode, "sync", domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"sync",
+			"Sync item limit (--limit) must not be negative.",
+			"Pass a positive integer for --limit or omit it.",
+			nil,
+		))
+	}
+
+	svc, cleanup, err := factory(ctx, cfg)
+	if err != nil {
+		return writeError(stdout, stderr, jsonMode, "sync", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
 
 	res, err := svc.Sync(ctx, domain.SyncOptions{
 		Repository: cfg.Repository,
@@ -188,7 +208,7 @@ func runSync(ctx context.Context, svc *app.Service, cfg config.Config, args []st
 	return 0
 }
 
-func runAnalyze(ctx context.Context, svc *app.Service, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
+func runAnalyze(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
 	if helpRequested {
 		fmt.Fprintln(stdout, "Usage: automain analyze --repo <owner/name> [--item <number>] [--limit <n>] [--reanalyze] [--json]")
 		return 0
@@ -199,6 +219,35 @@ func runAnalyze(ctx context.Context, svc *app.Service, cfg config.Config, args [
 	reanalyze := fs.Bool("reanalyze", false, "Re-run analysis even if item content hash matches")
 	if err := parseSubcommandFlags(fs, "analyze", args, "Run 'automain analyze --help' to inspect valid flags."); err != nil {
 		return writeError(stdout, stderr, jsonMode, "analyze", err)
+	}
+	if err := validateCLIRequiredRepo("analyze", cfg.Repository); err != nil {
+		return writeError(stdout, stderr, jsonMode, "analyze", err)
+	}
+	if *itemNum < 0 {
+		return writeError(stdout, stderr, jsonMode, "analyze", domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"analyze",
+			"Item number (--item) must be a positive integer.",
+			"Pass a valid GitHub issue, PR, or discussion number via --item <number>.",
+			nil,
+		))
+	}
+	if *limit < 0 {
+		return writeError(stdout, stderr, jsonMode, "analyze", domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"analyze",
+			"Analysis item limit (--limit) must not be negative.",
+			"Pass a positive integer for --limit or omit it.",
+			nil,
+		))
+	}
+
+	svc, cleanup, err := factory(ctx, cfg)
+	if err != nil {
+		return writeError(stdout, stderr, jsonMode, "analyze", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
 	}
 
 	res, err := svc.Analyze(ctx, domain.AnalyzeOptions{
@@ -220,7 +269,7 @@ func runAnalyze(ctx context.Context, svc *app.Service, cfg config.Config, args [
 	return 0
 }
 
-func runThreads(ctx context.Context, svc *app.Service, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
+func runThreads(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
 	action := "list"
 	rest := args
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -239,9 +288,33 @@ func runThreads(ctx context.Context, svc *app.Service, cfg config.Config, args [
 		if err := parseSubcommandFlags(fs, "threads.list", rest, "Run 'automain threads --help' for usage."); err != nil {
 			return writeError(stdout, stderr, jsonMode, "threads.list", err)
 		}
+		if err := validateCLIRequiredRepo("threads.list", cfg.Repository); err != nil {
+			return writeError(stdout, stderr, jsonMode, "threads.list", err)
+		}
+		statusVal := domain.ThreadStatus(strings.TrimSpace(*status))
+		if statusVal != "" {
+			if err := statusVal.Validate(); err != nil {
+				return writeError(stdout, stderr, jsonMode, "threads.list", domain.NewError(
+					domain.ErrorCodeInvalidInput,
+					"threads.list",
+					err.Error(),
+					"Use --status active, --status resolved, or --status stale.",
+					err,
+				))
+			}
+		}
+
+		svc, cleanup, err := factory(ctx, cfg)
+		if err != nil {
+			return writeError(stdout, stderr, jsonMode, "threads.list", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+
 		threads, err := svc.ListThreads(ctx, domain.ThreadFilter{
 			Repository: cfg.Repository,
-			Status:     domain.ThreadStatus(strings.TrimSpace(*status)),
+			Status:     statusVal,
 		})
 		if err != nil {
 			return writeError(stdout, stderr, jsonMode, "threads.list", err)
@@ -265,7 +338,26 @@ func runThreads(ctx context.Context, svc *app.Service, cfg config.Config, args [
 		if err := parseSubcommandFlags(fs, "threads.show", rest, "Run 'automain threads show --help' for usage."); err != nil {
 			return writeError(stdout, stderr, jsonMode, "threads.show", err)
 		}
-		detail, err := svc.GetThread(ctx, domain.ThreadID(strings.TrimSpace(*id)))
+		trimmedID := strings.TrimSpace(*id)
+		if trimmedID == "" {
+			return writeError(stdout, stderr, jsonMode, "threads.show", domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"threads.show",
+				"Thread ID (--id) is required.",
+				"Pass a non-empty thread ID via --id <thread-id>.",
+				nil,
+			))
+		}
+
+		svc, cleanup, err := factory(ctx, cfg)
+		if err != nil {
+			return writeError(stdout, stderr, jsonMode, "threads.show", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+
+		detail, err := svc.GetThread(ctx, domain.ThreadID(trimmedID))
 		if err != nil {
 			return writeError(stdout, stderr, jsonMode, "threads.show", err)
 		}
@@ -289,7 +381,7 @@ func runThreads(ctx context.Context, svc *app.Service, cfg config.Config, args [
 	}
 }
 
-func runRelationships(ctx context.Context, svc *app.Service, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
+func runRelationships(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
 	action := "list"
 	rest := args
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -330,11 +422,44 @@ func runRelationships(ctx context.Context, svc *app.Service, cfg config.Config, 
 				))
 			}
 		}
+		if err := validateCLIRequiredRepo("relationships.list", cfg.Repository); err != nil {
+			return writeError(stdout, stderr, jsonMode, "relationships.list", err)
+		}
+		if *itemNum < 0 {
+			return writeError(stdout, stderr, jsonMode, "relationships.list", domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"relationships.list",
+				"Item number (--item) must not be negative.",
+				"Pass a positive GitHub item number via --item <number>.",
+				nil,
+			))
+		}
+		typeVal := domain.RelationshipType(strings.TrimSpace(*relType))
+		if typeVal != "" {
+			if err := typeVal.Validate(); err != nil {
+				return writeError(stdout, stderr, jsonMode, "relationships.list", domain.NewError(
+					domain.ErrorCodeInvalidInput,
+					"relationships.list",
+					err.Error(),
+					"Pass a valid relationship type: reports_same_problem, proposes_fix, implements_decision, blocks_or_depends, related_context, or duplicate_of.",
+					err,
+				))
+			}
+		}
+
+		svc, cleanup, err := factory(ctx, cfg)
+		if err != nil {
+			return writeError(stdout, stderr, jsonMode, "relationships.list", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+
 		rels, err := svc.ListRelationships(ctx, domain.RelationshipFilter{
 			Repository: cfg.Repository,
 			ThreadID:   domain.ThreadID(strings.TrimSpace(*threadID)),
 			ItemNumber: *itemNum,
-			Type:       domain.RelationshipType(strings.TrimSpace(*relType)),
+			Type:       typeVal,
 			Verified:   verifiedPtr,
 		})
 		if err != nil {
@@ -359,7 +484,26 @@ func runRelationships(ctx context.Context, svc *app.Service, cfg config.Config, 
 		if err := parseSubcommandFlags(fs, "relationships.show", rest, "Run 'automain relationships show --help' for usage."); err != nil {
 			return writeError(stdout, stderr, jsonMode, "relationships.show", err)
 		}
-		rel, err := svc.GetRelationship(ctx, domain.RelationshipID(strings.TrimSpace(*id)))
+		trimmedID := strings.TrimSpace(*id)
+		if trimmedID == "" {
+			return writeError(stdout, stderr, jsonMode, "relationships.show", domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"relationships.show",
+				"Relationship ID (--id) is required.",
+				"Pass a non-empty relationship ID via --id <relationship-id>.",
+				nil,
+			))
+		}
+
+		svc, cleanup, err := factory(ctx, cfg)
+		if err != nil {
+			return writeError(stdout, stderr, jsonMode, "relationships.show", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+
+		rel, err := svc.GetRelationship(ctx, domain.RelationshipID(trimmedID))
 		if err != nil {
 			return writeError(stdout, stderr, jsonMode, "relationships.show", err)
 		}
@@ -383,7 +527,26 @@ func runRelationships(ctx context.Context, svc *app.Service, cfg config.Config, 
 		if err := parseSubcommandFlags(fs, "relationships.verify", rest, "Run 'automain relationships verify --help' for usage."); err != nil {
 			return writeError(stdout, stderr, jsonMode, "relationships.verify", err)
 		}
-		rel, err := svc.VerifyRelationship(ctx, domain.RelationshipID(strings.TrimSpace(*id)), !*unverify)
+		trimmedID := strings.TrimSpace(*id)
+		if trimmedID == "" {
+			return writeError(stdout, stderr, jsonMode, "relationships.verify", domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"relationships.verify",
+				"Relationship ID (--id) is required.",
+				"Pass a non-empty relationship ID via --id <relationship-id>.",
+				nil,
+			))
+		}
+
+		svc, cleanup, err := factory(ctx, cfg)
+		if err != nil {
+			return writeError(stdout, stderr, jsonMode, "relationships.verify", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+
+		rel, err := svc.VerifyRelationship(ctx, domain.RelationshipID(trimmedID), !*unverify)
 		if err != nil {
 			return writeError(stdout, stderr, jsonMode, "relationships.verify", err)
 		}
@@ -407,7 +570,7 @@ func runRelationships(ctx context.Context, svc *app.Service, cfg config.Config, 
 	}
 }
 
-func runStats(ctx context.Context, svc *app.Service, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
+func runStats(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
 	if helpRequested {
 		fmt.Fprintln(stdout, "Usage: automain stats --repo <owner/name> [--json]")
 		return 0
@@ -421,6 +584,18 @@ func runStats(ctx context.Context, svc *app.Service, cfg config.Config, args []s
 			nil,
 		))
 	}
+	if err := validateCLIRequiredRepo("stats", cfg.Repository); err != nil {
+		return writeError(stdout, stderr, jsonMode, "stats", err)
+	}
+
+	svc, cleanup, err := factory(ctx, cfg)
+	if err != nil {
+		return writeError(stdout, stderr, jsonMode, "stats", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
 	st, err := svc.Stats(ctx, cfg.Repository)
 	if err != nil {
 		return writeError(stdout, stderr, jsonMode, "stats", err)
@@ -435,7 +610,7 @@ func runStats(ctx context.Context, svc *app.Service, cfg config.Config, args []s
 	return 0
 }
 
-func runServe(ctx context.Context, _ *app.Service, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
+func runServe(ctx context.Context, _ ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
 	if helpRequested {
 		fmt.Fprintln(stdout, "Usage: automain serve [--listen <host:port>] [--db <path>] [--json]")
 		return 0
@@ -468,6 +643,29 @@ func runServe(ctx context.Context, _ *app.Service, cfg config.Config, args []str
 		"Run CLI commands directly or complete WO5 to enable 'automain serve'.",
 		nil,
 	))
+}
+
+func validateCLIRequiredRepo(operation, repo string) error {
+	trimmed := strings.TrimSpace(repo)
+	if trimmed == "" {
+		return domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			operation,
+			"Repository is required for this operation.",
+			"Pass --repo <owner/name> or set AUTOMAIN_REPO=<owner/name>.",
+			nil,
+		)
+	}
+	if err := domain.ValidateRepoSlug(trimmed); err != nil {
+		return domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			operation,
+			err.Error(),
+			"Pass the repository in owner/name format, for example --repo cli/cli.",
+			err,
+		)
+	}
+	return nil
 }
 
 func newSubFlagSet(name string) *flag.FlagSet {

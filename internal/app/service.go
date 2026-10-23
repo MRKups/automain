@@ -43,9 +43,10 @@ type AdapterStatus struct {
 
 // StatusReport summarizes application readiness, configuration, and adapter availability.
 type StatusReport struct {
-	Version  string        `json:"version"`
-	Config   StatusConfig  `json:"config"`
-	Adapters AdapterStatus `json:"adapters"`
+	Version       string        `json:"version"`
+	SchemaVersion int           `json:"schema_version"`
+	Config        StatusConfig  `json:"config"`
+	Adapters      AdapterStatus `json:"adapters"`
 }
 
 // Service coordinates domain operations across the CLI and HTTP API surfaces.
@@ -67,8 +68,13 @@ func (s *Service) Status(ctx context.Context) (StatusReport, error) {
 	if err := ctx.Err(); err != nil {
 		return StatusReport{}, domain.AsError("status", err)
 	}
+	schemaVersion := 0
+	if s.adapters.Store != nil {
+		schemaVersion = s.adapters.Store.SchemaVersion()
+	}
 	return StatusReport{
-		Version: Version,
+		Version:       Version,
+		SchemaVersion: schemaVersion,
 		Config: StatusConfig{
 			DBPath:         s.cfg.DBPath,
 			Repository:     s.cfg.Repository,
@@ -107,12 +113,15 @@ func (s *Service) Sync(ctx context.Context, opts domain.SyncOptions) (domain.Syn
 			nil,
 		)
 	}
-	if s.adapters.Store == nil || s.adapters.GitHub == nil {
+	if s.adapters.Store == nil {
+		return domain.SyncResult{}, storageNotConfiguredError("sync")
+	}
+	if s.adapters.GitHub == nil {
 		return domain.SyncResult{}, domain.NewError(
 			domain.ErrorCodeNotConfigured,
 			"sync",
-			"SQLite storage adapter and GitHub ingestion adapter are not wired yet.",
-			"Run 'automain status' to inspect adapter availability; storage and GitHub adapters are scheduled in WO2 and WO3.",
+			"GitHub ingestion adapter is not wired yet.",
+			"Run 'automain status' to inspect adapter availability; GitHub ingestion is scheduled in WO3.",
 			nil,
 		)
 	}
@@ -167,12 +176,15 @@ func (s *Service) Analyze(ctx context.Context, opts domain.AnalyzeOptions) (doma
 			nil,
 		)
 	}
-	if s.adapters.Store == nil || s.adapters.Finder == nil || s.adapters.Analyser == nil {
+	if s.adapters.Store == nil {
+		return domain.AnalyzeResult{}, storageNotConfiguredError("analyze")
+	}
+	if s.adapters.Finder == nil || s.adapters.Analyser == nil {
 		return domain.AnalyzeResult{}, domain.NewError(
 			domain.ErrorCodeNotConfigured,
 			"analyze",
-			"Storage, candidate finder, and relationship analyser adapters are not wired yet.",
-			"Run 'automain status' to inspect adapter availability; storage and discovery adapters are scheduled in WO2 and WO4.",
+			"Candidate finder and relationship analyser adapters are not wired yet.",
+			"Run 'automain status' to inspect adapter availability; discovery and analysis adapters are scheduled in WO4.",
 			nil,
 		)
 	}

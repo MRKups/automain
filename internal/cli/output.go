@@ -63,7 +63,7 @@ func writeHumanStatus(w io.Writer, rep app.StatusReport) {
 	fmt.Fprintf(w, "  llm_model:        %s\n\n", rep.Config.LLMModel)
 
 	fmt.Fprintf(w, "Adapters:\n")
-	fmt.Fprintf(w, "  storage:               %t\n", rep.Adapters.Storage)
+	fmt.Fprintf(w, "  storage:               %t (schema v%d)\n", rep.Adapters.Storage, rep.SchemaVersion)
 	fmt.Fprintf(w, "  github:                %t\n", rep.Adapters.GitHub)
 	fmt.Fprintf(w, "  candidate_finder:      %t\n", rep.Adapters.CandidateFinder)
 	fmt.Fprintf(w, "  relationship_analyser: %t\n", rep.Adapters.RelationshipAnalyser)

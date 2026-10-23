@@ -7,10 +7,12 @@ persistent threads backed by source evidence.
 ## Status
 
 Core domain contracts (`internal/domain`), runtime configuration
-(`internal/config`), application service facade (`internal/app`), embedded web
-asset boundary (`web`), and the `automain` CLI router (`cmd/automain`,
-`internal/cli`) are implemented. SQLite storage, GitHub ingestion, relationship
-analysis, HTTP endpoints, and the Svelte UI are not wired yet.
+(`internal/config`), SQLite persistence (`internal/storage/sqlite`), application
+service facade (`internal/app`), embedded web asset boundary (`web`), and the
+`automain` CLI (`cmd/automain`, `internal/cli`) for `status`, `version`,
+`threads`, `relationships`, and `stats` are implemented. GitHub ingestion
+(`sync`), relationship analysis (`analyze`), HTTP endpoints (`serve`), and the
+Svelte UI are not wired yet.
 
 ## Stack
 
