@@ -37,6 +37,7 @@ task sandbox -- status --json
 
 ```sh
 automain status [--db <path>] [--repo <owner/name>] [--json]
+automain version [--json]
 automain sync --repo <owner/name> [--limit <n>] [--since <RFC3339>] [--full] [--json]
 automain analyze --repo <owner/name> [--item <number>] [--limit <n>] [--reanalyze] [--json]
 automain threads [list|show] [--repo <owner/name>] [--id <thread-id>] [--json]
