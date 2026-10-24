@@ -20,6 +20,11 @@ tasks:
         fi
         npm --prefix web run build
 
+  build:web:
+    desc: Alias for web (build the Svelte frontend into web/dist)
+    cmds:
+      - task: web
+
   build:
     desc: Build the automain single binary into bin/automain
     cmds:

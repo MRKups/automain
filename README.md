@@ -8,11 +8,12 @@ persistent threads backed by source evidence.
 
 Core domain contracts (`internal/domain`), runtime configuration
 (`internal/config`), SQLite persistence (`internal/storage/sqlite`), GitHub
-ingestion (`internal/github`), candidate discovery and relationship analysis
-(`internal/analysis`), application service facade (`internal/app`), HTTP API
-server (`internal/server`), embedded Svelte UI (`web`), and the `automain` CLI
-(`cmd/automain`, `internal/cli`) for `status`, `version`, `sync`, `analyze`,
-`threads`, `relationships`, `stats`, and `serve` are implemented.
+ingestion (`internal/github`), candidate discovery (`llm`, `fts`, and `vector`)
+and relationship analysis (`internal/analysis`), application service facade
+(`internal/app`), HTTP API server (`internal/server`), embedded Svelte UI
+(`web`), and the `automain` CLI (`cmd/automain`, `internal/cli`) for `status`,
+`version`, `sync`, `items`, `analyze`, `threads`, `relationships`, `stats`,
+`graph`, `repositories`, and `serve` are implemented.
 
 ## Stack
 
@@ -25,6 +26,9 @@ server (`internal/server`), embedded Svelte UI (`web`), and the `automain` CLI
 Prerequisites: Go 1.24+, [Task](https://taskfile.dev), and Node.js 20+ (only when rebuilding `web/dist`).
 
 ```sh
+# Copy env.example to .env and configure GITHUB_TOKEN / AUTOMAIN_LLM_API_KEY
+cp env.example .env
+
 # Rebuild embedded frontend assets (optional when editing web/src/*)
 task web
 
@@ -44,10 +48,13 @@ task sandbox -- status --json
 automain status [--db <path>] [--repo <owner/name>] [--json]
 automain version [--json]
 automain sync --repo <owner/name> [--limit <n>] [--since <RFC3339>] [--full] [--json]
+automain items [list|show] --repo <owner/name> [--kind <kind>] [--state <state>] [--dirty] [--number <n>] [--json]
 automain analyze --repo <owner/name> [--item <number>] [--limit <n>] [--reanalyze] [--finder llm|fts|vector] [--json]
 automain threads [list|show] [--repo <owner/name>] [--id <thread-id>] [--json]
 automain relationships [list|show|verify] [--repo <owner/name>] [--id <rel-id>] [--json]
 automain stats --repo <owner/name> [--json]
+automain graph --repo <owner/name> [--json]
+automain repositories [list] [--db <path>] [--json]
 automain serve [--listen <host:port>] [--db <path>] [--repo <owner/name>] [--json]
 ```
 
@@ -55,7 +62,7 @@ automain serve [--listen <host:port>] [--db <path>] [--repo <owner/name>] [--jso
 
 - `GET /` serves the embedded Svelte single-page application.
 - `GET /healthz`, `GET /api/health`, `GET /api/version`, `GET /api/status`
-- `GET /api/repositories`, `GET /api/stats?repo=<owner/name>`
+- `GET /api/repositories`, `GET /api/stats?repo=<owner/name>`, `GET /api/graph?repo=<owner/name>`
 - `POST /api/sync` (`repository`, `limit`, `since`, `full`)
 - `POST /api/analyze` (`repository`, `item_number`, `limit`, `reanalyze`, `finder`)
 - `GET /api/items?repo=<owner/name>&kind=<kind>&state=<state>&dirty=<bool>&limit=<n>`

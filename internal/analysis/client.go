@@ -4,73 +4,118 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/MRKups/automain/internal/config"
 	"github.com/MRKups/automain/internal/domain"
+	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/shared"
+	"google.golang.org/genai"
 )
 
 const (
-	DefaultBaseURL       = "https://generativelanguage.googleapis.com/v1beta"
+	DefaultBaseURL       = config.DefaultGeminiBaseURL
 	DefaultModel         = config.DefaultLLMModel
 	DefaultUserAgent     = "automain/0.1.0-dev"
 	defaultHTTPTimeout   = 60 * time.Second
-	maxResponseBodyBytes = 32 << 20
 	maxCandidatesDefault = 10
 )
 
-// ClientConfig configures the Gemini LLM client used for candidate discovery and relationship analysis.
+// ClientConfig configures the LLM client used for candidate discovery and relationship analysis.
 type ClientConfig struct {
+	Provider         string
 	APIKey           string
 	Model            string
 	BaseURL          string
+	APIVersion       string
 	HTTPClient       *http.Client
 	Timeout          time.Duration
 	UserAgent        string
 	AllowEmptyAPIKey bool
 }
 
-// Client implements domain.RelationshipAnalyser and backs the LLM candidate finder.
+// Client implements domain.RelationshipAnalyser and backs the LLM candidate finder
+// using the official Google GenAI SDK (google.golang.org/genai) and OpenAI Go SDK (github.com/openai/openai-go).
 type Client struct {
+	provider         string
 	apiKey           string
 	model            string
 	baseURL          string
+	apiVersion       string
 	httpClient       *http.Client
 	userAgent        string
 	allowEmptyAPIKey bool
 }
 
-// NewClient constructs a Gemini LLM client from runtime configuration and environment overrides.
-// Optional environment overrides AUTOMAIN_LLM_API_URL and GEMINI_API_URL are respected when present.
+// NewClient constructs an LLM client from runtime configuration and environment overrides.
 func NewClient(cfg config.Config) *Client {
-	baseURL := strings.TrimSpace(os.Getenv("AUTOMAIN_LLM_API_URL"))
+	provider := config.NormalizeLLMProvider(cfg.LLMProvider)
+	baseURL := strings.TrimSpace(cfg.LLMBaseURL)
 	if baseURL == "" {
-		baseURL = strings.TrimSpace(os.Getenv("GEMINI_API_URL"))
+		baseURL = strings.TrimSpace(os.Getenv("AUTOMAIN_LLM_API_URL"))
 	}
+	if baseURL == "" {
+		switch provider {
+		case "openai":
+			baseURL = strings.TrimSpace(os.Getenv("OPENAI_API_URL"))
+			if baseURL == "" {
+				baseURL = strings.TrimSpace(os.Getenv("OPENAI_BASE_URL"))
+			}
+		case "deepseek":
+			baseURL = strings.TrimSpace(os.Getenv("DEEPSEEK_API_URL"))
+			if baseURL == "" {
+				baseURL = strings.TrimSpace(os.Getenv("DEEPSEEK_BASE_URL"))
+			}
+		default:
+			baseURL = strings.TrimSpace(os.Getenv("GEMINI_API_URL"))
+		}
+	}
+	apiVersion := strings.TrimSpace(os.Getenv("AUTOMAIN_GEMINI_API_VERSION"))
 	return NewClientWithConfig(ClientConfig{
-		APIKey:  cfg.LLMAPIKey,
-		Model:   cfg.LLMModel,
-		BaseURL: baseURL,
-		Timeout: cfg.Timeout,
+		Provider:   provider,
+		APIKey:     cfg.LLMAPIKey,
+		Model:      cfg.LLMModel,
+		BaseURL:    baseURL,
+		APIVersion: apiVersion,
+		Timeout:    cfg.Timeout,
 	})
 }
 
-// NewClientWithConfig constructs a Gemini LLM client from explicit ClientConfig settings.
+// NewClientWithConfig constructs an LLM client from explicit ClientConfig settings.
 func NewClientWithConfig(cfg ClientConfig) *Client {
+	provider := config.NormalizeLLMProvider(cfg.Provider)
 	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 	if baseURL == "" {
-		baseURL = DefaultBaseURL
+		switch provider {
+		case "openai":
+			baseURL = config.DefaultOpenAIBaseURL
+		case "deepseek":
+			baseURL = config.DefaultDeepSeekBaseURL
+		default:
+			baseURL = DefaultBaseURL
+		}
 	}
 
-	model := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(cfg.Model), "models/"))
+	rawModel := strings.TrimSpace(cfg.Model)
+	if provider == "gemini" {
+		rawModel = strings.TrimSpace(strings.TrimPrefix(rawModel, "models/"))
+	}
+	model := rawModel
 	if model == "" {
-		model = DefaultModel
+		switch provider {
+		case "openai":
+			model = config.DefaultOpenAIModel
+		case "deepseek":
+			model = config.DefaultDeepSeekModel
+		default:
+			model = DefaultModel
+		}
 	}
 
 	timeout := cfg.Timeout
@@ -91,9 +136,11 @@ func NewClientWithConfig(cfg ClientConfig) *Client {
 	}
 
 	return &Client{
+		provider:         provider,
 		apiKey:           strings.TrimSpace(cfg.APIKey),
 		model:            model,
 		baseURL:          baseURL,
+		apiVersion:       strings.TrimSpace(cfg.APIVersion),
 		httpClient:       httpClient,
 		userAgent:        userAgent,
 		allowEmptyAPIKey: cfg.AllowEmptyAPIKey,
@@ -115,64 +162,22 @@ func (c *Client) ValidateConfig() error {
 		return domain.NewError(
 			domain.ErrorCodeNotConfigured,
 			"analyze",
-			"LLM API key is not configured (AUTOMAIN_LLM_API_KEY or GEMINI_API_KEY).",
-			"Set AUTOMAIN_LLM_API_KEY or GEMINI_API_KEY in the environment before running 'automain analyze'.",
+			fmt.Sprintf("LLM API key is not configured for provider %q.", c.provider),
+			"Set AUTOMAIN_LLM_API_KEY (or GEMINI_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY) in .env or the environment before running 'automain analyze'.",
 			nil,
 		)
 	}
 	return nil
 }
 
-type geminiPart struct {
-	Text string `json:"text"`
-}
-
-type geminiContent struct {
-	Role  string       `json:"role,omitempty"`
-	Parts []geminiPart `json:"parts"`
-}
-
-type geminiGenerationConfig struct {
-	Temperature      float64        `json:"temperature"`
-	ResponseMimeType string         `json:"responseMimeType,omitempty"`
-	ResponseSchema   map[string]any `json:"responseSchema,omitempty"`
-}
-
-type geminiGenerateRequest struct {
-	SystemInstruction *geminiContent         `json:"systemInstruction,omitempty"`
-	Contents          []geminiContent        `json:"contents"`
-	GenerationConfig  geminiGenerationConfig `json:"generationConfig"`
-}
-
-type geminiGenerateResponse struct {
-	Candidates []struct {
-		Content struct {
-			Parts []struct {
-				Text string `json:"text"`
-			} `json:"parts"`
-		} `json:"content"`
-		FinishReason string `json:"finishReason"`
-	} `json:"candidates"`
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
-	Error *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-		Status  string `json:"status"`
-	} `json:"error"`
-}
-
-func (c *Client) endpointURL() string {
-	if strings.HasSuffix(c.baseURL, ":generateContent") || strings.HasSuffix(c.baseURL, "/chat/completions") {
-		return c.baseURL
+func (c *Client) isOpenAICompatible() bool {
+	if c.provider == "openai" || c.provider == "deepseek" {
+		return true
 	}
-	if strings.Contains(c.baseURL, "/models/") {
-		return c.baseURL + ":generateContent"
-	}
-	return fmt.Sprintf("%s/models/%s:generateContent", c.baseURL, url.PathEscape(c.model))
+	lowerURL := strings.ToLower(c.baseURL)
+	return strings.HasSuffix(lowerURL, "/chat/completions") ||
+		strings.Contains(lowerURL, "api.openai.com") ||
+		strings.Contains(lowerURL, "api.deepseek.com")
 }
 
 func (c *Client) generateJSON(ctx context.Context, systemPrompt, userPrompt string, schema map[string]any) ([]byte, error) {
@@ -183,60 +188,60 @@ func (c *Client) generateJSON(ctx context.Context, systemPrompt, userPrompt stri
 		return nil, err
 	}
 
-	reqPayload := geminiGenerateRequest{
-		Contents: []geminiContent{
-			{
-				Role:  "user",
-				Parts: []geminiPart{{Text: userPrompt}},
-			},
+	if c.isOpenAICompatible() {
+		return c.generateWithOpenAISDK(ctx, systemPrompt, userPrompt, schema)
+	}
+	return c.generateWithGeminiSDK(ctx, systemPrompt, userPrompt, schema)
+}
+
+func (c *Client) generateWithGeminiSDK(ctx context.Context, systemPrompt, userPrompt string, schema map[string]any) ([]byte, error) {
+	baseHost, apiVer := splitGeminiBaseURLAndVersion(c.baseURL, c.apiVersion)
+	headers := http.Header{}
+	headers.Set("User-Agent", c.userAgent)
+
+	apiKey := c.apiKey
+	if apiKey == "" && c.allowEmptyAPIKey {
+		apiKey = "test-empty-key"
+	}
+
+	genaiClient, err := genai.NewClient(ctx, &genai.ClientConfig{
+		APIKey:     apiKey,
+		Backend:    genai.BackendGeminiAPI,
+		HTTPClient: c.httpClient,
+		HTTPOptions: genai.HTTPOptions{
+			BaseURL:    baseHost,
+			APIVersion: apiVer,
+			Headers:    headers,
 		},
-		GenerationConfig: geminiGenerationConfig{
-			Temperature:      0.1,
-			ResponseMimeType: "application/json",
-			ResponseSchema:   schema,
-		},
+	})
+	if err != nil {
+		return nil, domain.NewError(
+			domain.ErrorCodeInternal,
+			"analyze",
+			fmt.Sprintf("Failed to initialize Google GenAI SDK client: %v", err),
+			"Verify AUTOMAIN_LLM_API_KEY and AUTOMAIN_LLM_API_URL.",
+			err,
+		)
+	}
+
+	temp := float32(0.1)
+	genCfg := &genai.GenerateContentConfig{
+		Temperature:        &temp,
+		ResponseMIMEType:   "application/json",
+		ResponseJsonSchema: normalizeJSONSchemaForGenAI(schema),
 	}
 	if strings.TrimSpace(systemPrompt) != "" {
-		reqPayload.SystemInstruction = &geminiContent{
-			Parts: []geminiPart{{Text: systemPrompt}},
-		}
+		genCfg.SystemInstruction = genai.NewContentFromText(systemPrompt, genai.RoleUser)
 	}
 
-	bodyBytes, err := json.Marshal(reqPayload)
-	if err != nil {
-		return nil, domain.NewError(
-			domain.ErrorCodeInternal,
-			"analyze",
-			fmt.Sprintf("Failed to encode LLM request payload: %v", err),
-			"Verify input item and candidate thread data.",
-			err,
-		)
-	}
-
-	reqURL := c.endpointURL()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, domain.NewError(
-			domain.ErrorCodeInternal,
-			"analyze",
-			fmt.Sprintf("Failed to build LLM HTTP request: %v", err),
-			"Verify the LLM endpoint URL configuration.",
-			err,
-		)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", c.userAgent)
-	if c.apiKey != "" {
-		req.Header.Set("x-goog-api-key", c.apiKey)
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := genaiClient.Models.GenerateContent(ctx, c.model, genai.Text(userPrompt), genCfg)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, domain.AsError("analyze", ctx.Err())
+		}
+		var apiErr genai.APIError
+		if errors.As(err, &apiErr) {
+			return nil, mapLLMStatusAndDetail(apiErr.Code, apiErr.Message)
 		}
 		return nil, domain.NewError(
 			domain.ErrorCodeExternalUnavailable,
@@ -246,59 +251,212 @@ func (c *Client) generateJSON(ctx context.Context, systemPrompt, userPrompt stri
 			err,
 		)
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-	}()
 
-	respBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
-	if readErr != nil {
+	if resp == nil || len(resp.Candidates) == 0 {
 		return nil, domain.NewError(
 			domain.ErrorCodeExternalUnavailable,
 			"analyze",
-			fmt.Sprintf("Failed to read LLM API response body: %v", readErr),
-			"Retry analysis or check network stability.",
-			readErr,
+			"Failed to extract structured JSON from LLM response: LLM response contained no candidates",
+			"Verify that the configured --finder and AUTOMAIN_LLM_MODEL support structured JSON output.",
+			nil,
 		)
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, mapLLMHTTPError(resp.StatusCode, respBytes)
-	}
-
-	extracted, err := extractJSONFromResponse(respBytes)
-	if err != nil {
+	text := strings.TrimSpace(resp.Text())
+	if text == "" {
 		return nil, domain.NewError(
 			domain.ErrorCodeExternalUnavailable,
 			"analyze",
-			fmt.Sprintf("Failed to extract structured JSON from LLM response: %v", err),
+			"Failed to extract structured JSON from LLM response: LLM response contained no candidate content parts",
 			"Verify that the configured --finder and AUTOMAIN_LLM_MODEL support structured JSON output.",
-			err,
+			nil,
+		)
+	}
+
+	extracted, cleanErr := cleanMarkdownJSON(text)
+	if cleanErr != nil {
+		return nil, domain.NewError(
+			domain.ErrorCodeExternalUnavailable,
+			"analyze",
+			fmt.Sprintf("Failed to extract structured JSON from LLM response: %v", cleanErr),
+			"Verify that the configured --finder and AUTOMAIN_LLM_MODEL support structured JSON output.",
+			cleanErr,
 		)
 	}
 	return extracted, nil
 }
 
-func mapLLMHTTPError(statusCode int, body []byte) error {
-	var env geminiGenerateResponse
-	_ = json.Unmarshal(body, &env)
-	detail := ""
-	if env.Error != nil && strings.TrimSpace(env.Error.Message) != "" {
-		detail = strings.TrimSpace(env.Error.Message)
-	} else {
-		var genericErr struct {
-			Message string `json:"message"`
-			Error   string `json:"error"`
+func (c *Client) generateWithOpenAISDK(ctx context.Context, systemPrompt, userPrompt string, schema map[string]any) ([]byte, error) {
+	baseURL := normalizeOpenAIBaseURL(c.baseURL)
+	apiKey := c.apiKey
+	if apiKey == "" && c.allowEmptyAPIKey {
+		apiKey = "test-empty-key"
+	}
+
+	oaiClient := openai.NewClient(
+		option.WithAPIKey(apiKey),
+		option.WithBaseURL(baseURL),
+		option.WithHTTPClient(c.httpClient),
+		option.WithHeader("User-Agent", c.userAgent),
+		option.WithMaxRetries(0),
+	)
+
+	sys := strings.TrimSpace(systemPrompt)
+	if len(schema) > 0 {
+		if schemaBytes, err := json.Marshal(normalizeJSONSchemaForGenAI(schema)); err == nil {
+			if sys != "" {
+				sys += "\n\n"
+			}
+			sys += "Respond ONLY with a valid JSON object conforming to this JSON schema: " + string(schemaBytes)
 		}
-		if json.Unmarshal(body, &genericErr) == nil {
-			if strings.TrimSpace(genericErr.Message) != "" {
-				detail = strings.TrimSpace(genericErr.Message)
-			} else if strings.TrimSpace(genericErr.Error) != "" {
-				detail = strings.TrimSpace(genericErr.Error)
+	}
+
+	var msgs []openai.ChatCompletionMessageParamUnion
+	if sys != "" {
+		msgs = append(msgs, openai.SystemMessage(sys))
+	}
+	msgs = append(msgs, openai.UserMessage(userPrompt))
+
+	isReasoner := strings.Contains(strings.ToLower(c.model), "reasoner")
+
+	buildParams := func(useJSONObject bool) openai.ChatCompletionNewParams {
+		p := openai.ChatCompletionNewParams{
+			Model:    shared.ChatModel(c.model),
+			Messages: msgs,
+		}
+		if !isReasoner {
+			p.Temperature = openai.Float(0.1)
+			if useJSONObject {
+				jsonFmt := shared.NewResponseFormatJSONObjectParam()
+				p.ResponseFormat = openai.ChatCompletionNewParamsResponseFormatUnion{
+					OfJSONObject: &jsonFmt,
+				}
+			}
+		}
+		return p
+	}
+
+	res, err := oaiClient.Chat.Completions.New(ctx, buildParams(true))
+	if err != nil {
+		var oaiErr *openai.Error
+		if errors.As(err, &oaiErr) && oaiErr.StatusCode == http.StatusBadRequest && !isReasoner {
+			// Retry once without response_format if the model endpoint does not support json_object mode.
+			if retryRes, retryErr := oaiClient.Chat.Completions.New(ctx, buildParams(false)); retryErr == nil {
+				res = retryRes
+				err = nil
 			}
 		}
 	}
 
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, domain.AsError("analyze", ctx.Err())
+		}
+		var oaiErr *openai.Error
+		if errors.As(err, &oaiErr) {
+			return nil, mapLLMStatusAndDetail(oaiErr.StatusCode, oaiErr.Message)
+		}
+		return nil, domain.NewError(
+			domain.ErrorCodeExternalUnavailable,
+			"analyze",
+			fmt.Sprintf("LLM API request failed: %v", err),
+			"Check network connectivity and LLM service availability, or increase --timeout.",
+			err,
+		)
+	}
+
+	if res == nil || len(res.Choices) == 0 {
+		return nil, domain.NewError(
+			domain.ErrorCodeExternalUnavailable,
+			"analyze",
+			"Failed to extract structured JSON from LLM response: LLM response contained no choices",
+			"Verify that the configured --finder and AUTOMAIN_LLM_MODEL support structured JSON output.",
+			nil,
+		)
+	}
+
+	text := strings.TrimSpace(res.Choices[0].Message.Content)
+	if text == "" {
+		return nil, domain.NewError(
+			domain.ErrorCodeExternalUnavailable,
+			"analyze",
+			"Failed to extract structured JSON from LLM response: LLM response contained empty choice content",
+			"Verify that the configured --finder and AUTOMAIN_LLM_MODEL support structured JSON output.",
+			nil,
+		)
+	}
+
+	extracted, cleanErr := cleanMarkdownJSON(text)
+	if cleanErr != nil {
+		return nil, domain.NewError(
+			domain.ErrorCodeExternalUnavailable,
+			"analyze",
+			fmt.Sprintf("Failed to extract structured JSON from LLM response: %v", cleanErr),
+			"Verify that the configured --finder and AUTOMAIN_LLM_MODEL support structured JSON output.",
+			cleanErr,
+		)
+	}
+	return extracted, nil
+}
+
+func splitGeminiBaseURLAndVersion(rawURL, explicitVersion string) (string, string) {
+	trimmed := strings.TrimRight(strings.TrimSpace(rawURL), "/")
+	apiVer := strings.TrimSpace(explicitVersion)
+	if strings.HasSuffix(trimmed, "/v1beta") {
+		trimmed = strings.TrimSuffix(trimmed, "/v1beta")
+		if apiVer == "" {
+			apiVer = "v1beta"
+		}
+	} else if strings.HasSuffix(trimmed, "/v1") {
+		trimmed = strings.TrimSuffix(trimmed, "/v1")
+		if apiVer == "" {
+			apiVer = "v1"
+		}
+	}
+	if apiVer == "" {
+		apiVer = "v1beta"
+	}
+	if trimmed == "" {
+		trimmed = "https://generativelanguage.googleapis.com"
+	}
+	return trimmed + "/", apiVer
+}
+
+func normalizeOpenAIBaseURL(rawURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(rawURL), "/")
+	trimmed = strings.TrimSuffix(trimmed, "/chat/completions")
+	if strings.EqualFold(trimmed, "https://api.openai.com") {
+		trimmed = "https://api.openai.com/v1"
+	}
+	if trimmed == "" {
+		trimmed = config.DefaultOpenAIBaseURL
+	}
+	return trimmed + "/"
+}
+
+func normalizeJSONSchemaForGenAI(schema map[string]any) map[string]any {
+	if schema == nil {
+		return nil
+	}
+	out := make(map[string]any, len(schema))
+	for k, v := range schema {
+		if k == "type" {
+			if s, ok := v.(string); ok {
+				out[k] = strings.ToLower(s)
+				continue
+			}
+		}
+		if subMap, ok := v.(map[string]any); ok {
+			out[k] = normalizeJSONSchemaForGenAI(subMap)
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func mapLLMStatusAndDetail(statusCode int, detail string) error {
+	detail = strings.TrimSpace(detail)
 	switch statusCode {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		msg := fmt.Sprintf("LLM API authentication failed (HTTP %d).", statusCode)
@@ -309,7 +467,7 @@ func mapLLMHTTPError(statusCode int, body []byte) error {
 			domain.ErrorCodeExternalUnavailable,
 			"analyze",
 			msg,
-			"Verify that AUTOMAIN_LLM_API_KEY or GEMINI_API_KEY is valid and has Gemini API access.",
+			"Verify that AUTOMAIN_LLM_API_KEY (or GEMINI_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY) is valid.",
 			nil,
 		)
 	case http.StatusTooManyRequests:
@@ -333,66 +491,10 @@ func mapLLMHTTPError(statusCode int, body []byte) error {
 			domain.ErrorCodeExternalUnavailable,
 			"analyze",
 			msg,
-			"Verify AUTOMAIN_LLM_MODEL and retry analysis later.",
+			"Verify AUTOMAIN_LLM_PROVIDER and AUTOMAIN_LLM_MODEL, then retry analysis.",
 			nil,
 		)
 	}
-}
-
-func extractJSONFromResponse(raw []byte) ([]byte, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 {
-		return nil, fmt.Errorf("empty response body")
-	}
-
-	var rawMap map[string]json.RawMessage
-	if err := json.Unmarshal(trimmed, &rawMap); err == nil {
-		if rawCandidates, hasCandidates := rawMap["candidates"]; hasCandidates {
-			var stringCandidates []string
-			if json.Unmarshal(rawCandidates, &stringCandidates) == nil {
-				return cleanMarkdownJSON(string(trimmed))
-			}
-		}
-
-		var env geminiGenerateResponse
-		if err := json.Unmarshal(trimmed, &env); err == nil {
-			if env.Error != nil && strings.TrimSpace(env.Error.Message) != "" {
-				return nil, fmt.Errorf("API error: %s", strings.TrimSpace(env.Error.Message))
-			}
-		}
-
-		_, hasCandidates := rawMap["candidates"]
-		_, hasPromptFeedback := rawMap["promptFeedback"]
-		if hasCandidates || hasPromptFeedback {
-			if len(env.Candidates) == 0 {
-				return nil, fmt.Errorf("LLM response contained no candidates")
-			}
-			var combined strings.Builder
-			for _, part := range env.Candidates[0].Content.Parts {
-				if strings.TrimSpace(part.Text) != "" {
-					combined.WriteString(part.Text)
-				}
-			}
-			text := strings.TrimSpace(combined.String())
-			if text == "" {
-				return nil, fmt.Errorf("LLM response contained no candidate content parts")
-			}
-			return cleanMarkdownJSON(text)
-		}
-
-		if _, hasChoices := rawMap["choices"]; hasChoices {
-			if len(env.Choices) == 0 {
-				return nil, fmt.Errorf("LLM response contained no choices")
-			}
-			text := strings.TrimSpace(env.Choices[0].Message.Content)
-			if text == "" {
-				return nil, fmt.Errorf("LLM response contained empty choice content")
-			}
-			return cleanMarkdownJSON(text)
-		}
-	}
-
-	return cleanMarkdownJSON(string(trimmed))
 }
 
 func cleanMarkdownJSON(text string) ([]byte, error) {
@@ -412,7 +514,7 @@ func cleanMarkdownJSON(text string) ([]byte, error) {
 	if s == "" {
 		return nil, fmt.Errorf("empty JSON content")
 	}
-	if json.Valid([]byte(s)) {
+	if json.Valid([]byte(bytes.TrimSpace([]byte(s)))) {
 		return []byte(s), nil
 	}
 

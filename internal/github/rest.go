@@ -276,11 +276,10 @@ func (c *Client) fetchIssuesAndPRs(
 			)
 		}
 
-		bodyBytes, headers, statusCode, err := c.doRESTGet(ctx, reqURL, repo, false)
+		bodyBytes, headers, _, err := c.doRESTGet(ctx, reqURL, repo, false)
 		if err != nil {
 			return nil, err
 		}
-		_ = statusCode
 
 		var rawIssues []restIssue
 		if err := json.Unmarshal(bodyBytes, &rawIssues); err != nil {
@@ -656,10 +655,7 @@ func (c *Client) doRESTGet(ctx context.Context, reqURL, repo string, allowNotFou
 			err,
 		)
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-	}()
+	defer drainAndCloseBody(resp.Body)
 
 	bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 	if readErr != nil {
@@ -683,12 +679,29 @@ func (c *Client) doRESTGet(ctx context.Context, reqURL, repo string, allowNotFou
 	return bodyBytes, resp.Header, resp.StatusCode, nil
 }
 
+func drainAndCloseBody(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	if _, err := io.Copy(io.Discard, body); err != nil {
+		if closeErr := body.Close(); closeErr != nil {
+			return
+		}
+		return
+	}
+	if err := body.Close(); err != nil {
+		return
+	}
+}
+
 func mapHTTPError(statusCode int, headers http.Header, body []byte, repo string, hasToken bool) error {
 	var apiMsg struct {
 		Message string `json:"message"`
 	}
-	_ = json.Unmarshal(body, &apiMsg)
-	detail := strings.TrimSpace(apiMsg.Message)
+	detail := ""
+	if err := json.Unmarshal(body, &apiMsg); err == nil {
+		detail = strings.TrimSpace(apiMsg.Message)
+	}
 
 	switch statusCode {
 	case http.StatusNotFound:

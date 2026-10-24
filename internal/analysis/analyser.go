@@ -370,7 +370,7 @@ func NormalizeDecision(
 	for _, m := range decision.MatchedThreads {
 		tid := domain.ThreadID(strings.TrimSpace(string(m.ThreadID)))
 		if tid == "" {
-			continue
+			return domain.AnalysisDecision{}, fmt.Errorf("matched thread link is missing thread_id")
 		}
 
 		cand, inCandidates := candidateByID[tid]
@@ -407,10 +407,13 @@ func NormalizeDecision(
 
 		explanation := sanitizeProse(m.Explanation)
 		if explanation == "" {
-			explanation = sanitizeProse(fmt.Sprintf("Item #%d (%s) relates to thread %s as %s.", item.Number, item.Title, tid, relType))
+			return domain.AnalysisDecision{}, fmt.Errorf("matched thread %q is missing a relationship explanation", tid)
 		}
 
-		evidence := GroundEvidenceRefs(m.Evidence, item, comments, cand.Items)
+		evidence, err := ValidateAndGroundEvidenceRefs(m.Evidence, item, comments, cand.Items)
+		if err != nil {
+			return domain.AnalysisDecision{}, fmt.Errorf("matched thread %q: %w", tid, err)
+		}
 
 		normMatched = append(normMatched, domain.MatchedThreadLink{
 			ThreadID:             tid,
@@ -429,24 +432,14 @@ func NormalizeDecision(
 		summary := sanitizeProse(n.Summary)
 		explanation := sanitizeProse(n.Explanation)
 
-		if title == "" && summary == "" && explanation == "" {
-			continue
-		}
 		if title == "" {
-			title = sanitizeProse(item.Title)
-			if title == "" {
-				title = DefaultItemExcerpt(item)
-			}
+			return domain.AnalysisDecision{}, fmt.Errorf("new thread proposal is missing a title")
 		}
 		if summary == "" {
-			if explanation != "" {
-				summary = explanation
-			} else {
-				summary = DefaultItemExcerpt(item)
-			}
+			return domain.AnalysisDecision{}, fmt.Errorf("new thread proposal %q is missing a summary", title)
 		}
 		if explanation == "" {
-			explanation = summary
+			return domain.AnalysisDecision{}, fmt.Errorf("new thread proposal %q is missing a relationship explanation", title)
 		}
 
 		relType, err := NormalizeRelationshipType(n.RelationshipType, item.Kind)
@@ -464,7 +457,10 @@ func NormalizeDecision(
 			return domain.AnalysisDecision{}, err
 		}
 
-		evidence := GroundEvidenceRefs(n.Evidence, item, comments, nil)
+		evidence, err := ValidateAndGroundEvidenceRefs(n.Evidence, item, comments, nil)
+		if err != nil {
+			return domain.AnalysisDecision{}, fmt.Errorf("new thread proposal %q: %w", title, err)
+		}
 
 		normNew = append(normNew, domain.NewThreadProposal{
 			Title:            title,
@@ -475,6 +471,10 @@ func NormalizeDecision(
 			Explanation:      explanation,
 			Evidence:         evidence,
 		})
+	}
+
+	if len(normMatched) == 0 && len(normNew) == 0 {
+		return domain.AnalysisDecision{}, fmt.Errorf("analysis decision for %s#%d produced no matched threads and no new threads", item.Repository, item.Number)
 	}
 
 	return domain.AnalysisDecision{

@@ -120,6 +120,12 @@ type Comment struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
+// ItemDetail bundles an Item with its chronologically ordered Comments.
+type ItemDetail struct {
+	Item     Item      `json:"item"`
+	Comments []Comment `json:"comments"`
+}
+
 // SyncWatermark records incremental synchronization progress for a repository.
 type SyncWatermark struct {
 	Repository   string     `json:"repository"`

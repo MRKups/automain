@@ -7,6 +7,7 @@
   let repositories = $state([]);
   let statusReport = $state(null);
   let stats = $state(null);
+  let graphData = $state(null);
 
   let loading = $state(false);
   let busyOp = $state('');
@@ -114,7 +115,8 @@
     if (!res.ok || !body?.ok) {
       const msg = body?.error?.message || `HTTP ${res.status}`;
       const code = body?.error?.code || 'ERR';
-      throw new Error(`${code}: ${msg}`);
+      const recovery = body?.error?.recovery ? ` (${body.error.recovery})` : '';
+      throw new Error(`${code}: ${msg}${recovery}`);
     }
     return body.data;
   }
@@ -179,7 +181,8 @@
       await Promise.all([
         loadThreads({ throwOnError: true }),
         loadRelationships({ throwOnError: true }),
-        loadItems({ throwOnError: true })
+        loadItems({ throwOnError: true }),
+        loadGraph({ throwOnError: true })
       ]);
       if (!opts.preserveNotice) {
         lastNotice = `loaded ${trimmed}`;
@@ -336,6 +339,7 @@
       const [statsData] = await Promise.all([
         trimmed ? apiFetch(`/api/stats?repo=${encodeURIComponent(trimmed)}`) : Promise.resolve(stats),
         loadRelationships({ throwOnError: true }),
+        loadGraph({ throwOnError: true }),
         selectedThreadId ? selectThread(selectedThreadId, { throwOnError: true }) : Promise.resolve()
       ]);
       stats = statsData;
@@ -415,6 +419,73 @@
   function inspectItemFromThread(num) {
     activeTab = 'items';
     selectItem(num);
+  }
+
+  function inspectThreadFromGraph(id) {
+    activeTab = 'threads';
+    selectThread(id);
+  }
+
+  async function loadGraph(opts = {}) {
+    const trimmed = repo.trim();
+    if (!trimmed) return;
+    if (!opts.throwOnError) lastError = '';
+    try {
+      const params = new URLSearchParams({ repo: trimmed });
+      graphData = await apiFetch(`/api/graph?${params.toString()}`);
+    } catch (err) {
+      lastError = err.message || String(err);
+      if (opts.throwOnError) throw err;
+    }
+  }
+
+  function buildGraphLayout(g) {
+    const gThreads = g?.threads || [];
+    const gItems = g?.items || [];
+    const gRels = g?.relationships || [];
+    const rowSpacing = 44;
+    const topPad = 32;
+    const height = Math.max(220, Math.max(gThreads.length, gItems.length) * rowSpacing + topPad * 2);
+
+    const threadCountsByItem = {};
+    for (const rel of gRels) {
+      if (!threadCountsByItem[rel.item_number]) {
+        threadCountsByItem[rel.item_number] = new Set();
+      }
+      threadCountsByItem[rel.item_number].add(rel.thread_id);
+    }
+
+    const threadPos = {};
+    const threadNodes = gThreads.map((th, idx) => {
+      const y = topPad + idx * rowSpacing;
+      threadPos[th.id] = { x: 180, y };
+      return { ...th, x: 180, y };
+    });
+
+    const itemPos = {};
+    const itemNodes = gItems.map((it, idx) => {
+      const y = topPad + idx * rowSpacing;
+      const threadCount = threadCountsByItem[it.number]?.size || 0;
+      itemPos[it.number] = { x: 560, y };
+      return { ...it, x: 560, y, multiThread: threadCount > 1, threadCount };
+    });
+
+    const edges = [];
+    for (const rel of gRels) {
+      const tp = threadPos[rel.thread_id];
+      const ip = itemPos[rel.item_number];
+      if (tp && ip) {
+        edges.push({
+          ...rel,
+          x1: tp.x + 70,
+          y1: tp.y,
+          x2: ip.x - 70,
+          y2: ip.y
+        });
+      }
+    }
+
+    return { width: 760, height, threadNodes, itemNodes, edges };
   }
 
   onMount(() => {
@@ -601,6 +672,13 @@
         onclick={() => (activeTab = 'items')}
       >
         items ({items.length})
+      </button>
+      <button
+        type="button"
+        class={activeTab === 'graph' ? 'active-tab' : ''}
+        onclick={() => (activeTab = 'graph')}
+      >
+        graph ({(graphData?.relationships || []).length})
       </button>
       <button
         type="button"
@@ -809,7 +887,13 @@
                 {#each selectedThreadDetail.items || [] as entry, idx}
                   <tr>
                     <td class="lineno">{fmtLine(idx)}</td>
-                    <td class="mono nowrap">#{entry.number}</td>
+                    <td class="mono nowrap">
+                      {#if entry.url}
+                        <a href={entry.url} target="_blank" rel="noreferrer">#{entry.number}</a>
+                      {:else}
+                        #{entry.number}
+                      {/if}
+                    </td>
                     <td class="mono">{entry.kind}</td>
                     <td class={statusClass(entry.state)}>{entry.state}</td>
                     <td class="mono">{entry.author || '-'}</td>
@@ -869,7 +953,13 @@
                               <tr>
                                 <td class="lineno">{fmtLine(evIdx)}</td>
                                 <td class="mono nowrap">
-                                  {ev.source_kind}:#{ev.item_number}{ev.comment_id ? `:${ev.comment_id}` : ''}
+                                  {#if ev.url}
+                                    <a href={ev.url} target="_blank" rel="noreferrer">
+                                      {ev.source_kind}:#{ev.item_number}{ev.comment_id ? `:${ev.comment_id}` : ''}
+                                    </a>
+                                  {:else}
+                                    {ev.source_kind}:#{ev.item_number}{ev.comment_id ? `:${ev.comment_id}` : ''}
+                                  {/if}
                                 </td>
                                 <td class="mono nowrap">{ev.author || '-'}</td>
                                 <td class="mono">{ev.excerpt}</td>
@@ -970,7 +1060,13 @@
                           <tr>
                             <td class="lineno">{fmtLine(evIdx)}</td>
                             <td class="mono nowrap">
-                              {ev.source_kind}:#{ev.item_number}{ev.comment_id ? `:${ev.comment_id}` : ''}
+                              {#if ev.url}
+                                <a href={ev.url} target="_blank" rel="noreferrer">
+                                  {ev.source_kind}:#{ev.item_number}{ev.comment_id ? `:${ev.comment_id}` : ''}
+                                </a>
+                              {:else}
+                                {ev.source_kind}:#{ev.item_number}{ev.comment_id ? `:${ev.comment_id}` : ''}
+                              {/if}
                             </td>
                             <td class="mono nowrap">{ev.author || '-'}</td>
                             <td class="mono">{ev.excerpt}</td>
@@ -1078,7 +1174,15 @@
                 <tr>
                   <td class="lineno">L001</td>
                   <td class="mono st-muted">number</td>
-                  <td class="mono">#{selectedItemDetail.item.number}</td>
+                  <td class="mono">
+                    {#if selectedItemDetail.item.url}
+                      <a href={selectedItemDetail.item.url} target="_blank" rel="noreferrer">
+                        #{selectedItemDetail.item.number}
+                      </a>
+                    {:else}
+                      #{selectedItemDetail.item.number}
+                    {/if}
+                  </td>
                   <td class="mono st-muted">kind</td>
                   <td class="mono">{selectedItemDetail.item.kind}</td>
                 </tr>
@@ -1164,6 +1268,218 @@
         {/if}
       </div>
     </div>
+  {:else if activeTab === 'graph'}
+    {@const layout = buildGraphLayout(graphData)}
+    <div class="workspace-split">
+      <div class="pane">
+        <div class="pane-header">
+          <span>THREAD-ITEM RELATIONSHIP NETWORK</span>
+          <span class="st-muted">
+            threads: {layout.threadNodes.length} | items: {layout.itemNodes.length} | edges: {layout.edges.length}
+          </span>
+        </div>
+        <div class="section-block" style="padding:8px;overflow:auto">
+          {#if layout.threadNodes.length === 0 && layout.itemNodes.length === 0}
+            <div class="mono st-muted">0 graph nodes in active repository</div>
+          {:else}
+            <svg
+              viewBox="0 0 {layout.width} {layout.height}"
+              width="100%"
+              height={layout.height}
+              style="background:#0a0d12;border:1px solid #1e2631"
+            >
+              {#each layout.edges as edge}
+                <line
+                  x1={edge.x1}
+                  y1={edge.y1}
+                  x2={edge.x2}
+                  y2={edge.y2}
+                  stroke={edge.explicitly_linked ? '#4b5563' : '#f59e0b'}
+                  stroke-width={edge.verified_by_human ? '2' : '1.25'}
+                  stroke-dasharray={edge.explicitly_linked ? 'none' : '4 3'}
+                />
+              {/each}
+              {#each layout.threadNodes as th}
+                <g
+                  style="cursor:pointer"
+                  role="button"
+                  tabindex="0"
+                  onclick={() => inspectThreadFromGraph(th.id)}
+                  onkeydown={(e) => e.key === 'Enter' && inspectThreadFromGraph(th.id)}
+                >
+                  <rect
+                    x={th.x - 70}
+                    y={th.y - 14}
+                    width="140"
+                    height="28"
+                    fill="#111827"
+                    stroke={th.status === 'resolved' ? '#10b981' : '#3b82f6'}
+                    stroke-width="1.5"
+                  />
+                  <text
+                    x={th.x}
+                    y={th.y + 4}
+                    fill="#e5e7eb"
+                    font-family="monospace"
+                    font-size="11"
+                    text-anchor="middle"
+                  >
+                    {th.id.slice(0, 12)} ({th.item_count})
+                  </text>
+                </g>
+              {/each}
+              {#each layout.itemNodes as it}
+                {@const kindStroke =
+                  it.kind === 'pull_request'
+                    ? '#a855f7'
+                    : it.kind === 'discussion'
+                      ? '#06b6d4'
+                      : '#10b981'}
+                <g
+                  style="cursor:pointer"
+                  role="button"
+                  tabindex="0"
+                  onclick={() => inspectItemFromThread(it.number)}
+                  onkeydown={(e) => e.key === 'Enter' && inspectItemFromThread(it.number)}
+                >
+                  <rect
+                    x={it.x - 70}
+                    y={it.y - 14}
+                    width="140"
+                    height="28"
+                    fill={it.multiThread ? '#291d0a' : '#111827'}
+                    stroke={it.multiThread ? '#f59e0b' : kindStroke}
+                    stroke-width={it.multiThread ? '2' : '1.5'}
+                  />
+                  <text
+                    x={it.x}
+                    y={it.y + 4}
+                    fill="#e5e7eb"
+                    font-family="monospace"
+                    font-size="11"
+                    text-anchor="middle"
+                  >
+                    #{it.number} [{it.kind.slice(0, 2)}]
+                  </text>
+                </g>
+              {/each}
+            </svg>
+          {/if}
+        </div>
+      </div>
+
+      <div class="pane">
+        <div class="pane-header">
+          <span>REPEATED PROBLEMS</span>
+          <span class="st-muted">rows: {(stats?.repeated_problems || []).length}</span>
+        </div>
+        <div class="section-block">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>line</th>
+                <th>thread</th>
+                <th>status</th>
+                <th class="num">reports</th>
+                <th class="num">items</th>
+                <th>title</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#if (stats?.repeated_problems || []).length === 0}
+                <tr>
+                  <td class="lineno">L000</td>
+                  <td colspan="5" class="st-muted">0 repeated problem threads</td>
+                </tr>
+              {:else}
+                {#each stats?.repeated_problems || [] as rp, idx}
+                  <tr class="clickable" onclick={() => inspectThreadFromGraph(rp.thread_id)}>
+                    <td class="lineno">{fmtLine(idx)}</td>
+                    <td class="mono nowrap">{rp.thread_id}</td>
+                    <td class={statusClass(rp.status)}>{rp.status}</td>
+                    <td class="num">{rp.problem_report_count ?? rp.report_count ?? 0}</td>
+                    <td class="num">{rp.item_count}</td>
+                    <td>{rp.title}</td>
+                  </tr>
+                {/each}
+              {/if}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="pane-header">
+          <span>MULTI-THREAD ITEMS</span>
+          <span class="st-muted">rows: {(stats?.multi_thread_items || []).length}</span>
+        </div>
+        <div class="section-block">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>line</th>
+                <th class="num">item</th>
+                <th>kind</th>
+                <th>state</th>
+                <th class="num">threads</th>
+                <th>title</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#if (stats?.multi_thread_items || []).length === 0}
+                <tr>
+                  <td class="lineno">L000</td>
+                  <td colspan="5" class="st-muted">0 multi-thread items</td>
+                </tr>
+              {:else}
+                {#each stats?.multi_thread_items || [] as mt, idx}
+                  <tr class="clickable" onclick={() => inspectItemFromThread(mt.number)}>
+                    <td class="lineno">{fmtLine(idx)}</td>
+                    <td class="num">#{mt.number}</td>
+                    <td class="mono">{mt.kind}</td>
+                    <td class={statusClass(mt.state)}>{mt.state}</td>
+                    <td class="num">{mt.thread_count}</td>
+                    <td>{mt.title}</td>
+                  </tr>
+                {/each}
+              {/if}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="pane-header">
+          <span>UNRESOLVED ITEMS</span>
+          <span class="st-muted">rows: {(stats?.unresolved_items || []).length}</span>
+        </div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>line</th>
+              <th class="num">item</th>
+              <th>kind</th>
+              <th>state</th>
+              <th>title</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#if (stats?.unresolved_items || []).length === 0}
+              <tr>
+                <td class="lineno">L000</td>
+                <td colspan="4" class="st-muted">0 unresolved items</td>
+              </tr>
+            {:else}
+              {#each stats?.unresolved_items || [] as ui, idx}
+                <tr class="clickable" onclick={() => inspectItemFromThread(ui.number)}>
+                  <td class="lineno">{fmtLine(idx)}</td>
+                  <td class="num">#{ui.number}</td>
+                  <td class="mono">{ui.kind}</td>
+                  <td class={statusClass(ui.state)}>{ui.state}</td>
+                  <td>{ui.title}</td>
+                </tr>
+              {/each}
+            {/if}
+          </tbody>
+        </table>
+      </div>
+    </div>
   {:else if activeTab === 'status'}
     <div class="workspace-split">
       <div class="pane">
@@ -1228,7 +1544,9 @@
             <tr>
               <td class="lineno">L007</td>
               <td class="mono">relationship_analyser</td>
-              <td class="mono">model={statusReport?.config?.llm_model || '-'}</td>
+              <td class="mono">
+                provider={statusReport?.config?.llm_provider || '-'} model={statusReport?.config?.llm_model || '-'}
+              </td>
               <td class={statusClass(statusReport?.adapters?.relationship_analyser ? 'pass' : 'unconfigured')}>
                 {statusReport?.adapters?.relationship_analyser ? 'pass' : 'unconfigured'}
               </td>

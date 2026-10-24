@@ -36,6 +36,9 @@ func DeterministicRelationshipID(repo string, threadID domain.ThreadID, itemNumb
 // NormalizeRelationshipType maps raw LLM relationship strings to valid domain.RelationshipType constants.
 func NormalizeRelationshipType(raw domain.RelationshipType, itemKind domain.ItemKind) (domain.RelationshipType, error) {
 	cleaned := strings.ToLower(strings.TrimSpace(string(raw)))
+	if cleaned == "" {
+		return "", fmt.Errorf("relationship_type must not be empty")
+	}
 	cleaned = strings.ReplaceAll(cleaned, "-", "_")
 	cleaned = strings.ReplaceAll(cleaned, " ", "_")
 
@@ -45,7 +48,7 @@ func NormalizeRelationshipType(raw domain.RelationshipType, itemKind domain.Item
 	}
 
 	switch cleaned {
-	case "", "same_problem", "problem", "bug", "issue", "reports_problem":
+	case "same_problem", "problem", "bug", "issue", "reports_problem":
 		if itemKind == domain.ItemKindPullRequest {
 			return domain.RelationshipProposesFix, nil
 		}
@@ -112,14 +115,38 @@ func NormalizeThreadStatus(raw domain.ThreadStatus, fallback domain.ThreadStatus
 	}
 }
 
-// GroundEvidenceRefs normalizes and enriches evidence references against the analyzed item,
-// its comments, and candidate thread member items.
-func GroundEvidenceRefs(
+// NormalizeEvidenceSourceKind maps raw LLM evidence source_kind values to valid domain.EvidenceSourceKind constants.
+func NormalizeEvidenceSourceKind(raw domain.EvidenceSourceKind) (domain.EvidenceSourceKind, error) {
+	cleaned := strings.ToLower(strings.TrimSpace(string(raw)))
+	cleaned = strings.ReplaceAll(cleaned, "-", "_")
+	cleaned = strings.ReplaceAll(cleaned, " ", "_")
+
+	candidate := domain.EvidenceSourceKind(cleaned)
+	if err := candidate.Validate(); err == nil {
+		return candidate, nil
+	}
+	switch cleaned {
+	case "body", "item", "issue_body", "pr_body", "pull_request_body", "discussion_body":
+		return domain.EvidenceSourceItemBody, nil
+	case "issue_comment", "pr_comment", "discussion_comment", "reply":
+		return domain.EvidenceSourceComment, nil
+	default:
+		return "", fmt.Errorf("invalid evidence source_kind %q", raw)
+	}
+}
+
+// ValidateAndGroundEvidenceRefs validates untrusted model evidence references against the
+// analyzed item, its comments, and candidate thread member items, and enriches optional author/URL fields.
+func ValidateAndGroundEvidenceRefs(
 	raw []domain.EvidenceRef,
 	item domain.Item,
 	comments []domain.Comment,
 	candidateItems []domain.Item,
-) []domain.EvidenceRef {
+) ([]domain.EvidenceRef, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("at least one source evidence reference is required")
+	}
+
 	itemsByNum := make(map[int]domain.Item, len(candidateItems)+1)
 	for _, ci := range candidateItems {
 		if ci.Number > 0 {
@@ -139,72 +166,62 @@ func GroundEvidenceRefs(
 	}
 
 	out := make([]domain.EvidenceRef, 0, len(raw))
-	for _, ev := range raw {
-		kindStr := strings.ToLower(strings.TrimSpace(string(ev.SourceKind)))
-		commentID := strings.TrimSpace(ev.CommentID)
+	for idx, ev := range raw {
+		sourceKind, err := NormalizeEvidenceSourceKind(ev.SourceKind)
+		if err != nil {
+			return nil, fmt.Errorf("evidence[%d]: %w", idx, err)
+		}
 		excerpt := sanitizeProse(ev.Excerpt)
+		if excerpt == "" {
+			return nil, fmt.Errorf("evidence[%d]: excerpt must not be empty", idx)
+		}
+
+		if sourceKind == domain.EvidenceSourceComment {
+			commentID := strings.TrimSpace(ev.CommentID)
+			if commentID == "" {
+				return nil, fmt.Errorf("evidence[%d]: comment evidence must include a non-empty comment_id", idx)
+			}
+			matchedComment, exists := commentsByID[commentID]
+			if !exists {
+				return nil, fmt.Errorf("evidence[%d]: unknown comment_id %q for item #%d", idx, commentID, item.Number)
+			}
+			itemNum := ev.ItemNumber
+			if itemNum <= 0 {
+				itemNum = matchedComment.ItemNumber
+			}
+			if matchedComment.ItemNumber > 0 && itemNum != matchedComment.ItemNumber {
+				return nil, fmt.Errorf("evidence[%d]: comment_id %q belongs to item #%d, not #%d", idx, commentID, matchedComment.ItemNumber, itemNum)
+			}
+			author := strings.TrimSpace(ev.Author)
+			if author == "" {
+				author = matchedComment.Author
+			}
+			urlStr := strings.TrimSpace(ev.URL)
+			if urlStr == "" {
+				urlStr = matchedComment.URL
+			}
+			validated := domain.EvidenceRef{
+				SourceKind: domain.EvidenceSourceComment,
+				ItemNumber: itemNum,
+				CommentID:  commentID,
+				Author:     author,
+				Excerpt:    excerpt,
+				URL:        urlStr,
+			}
+			if err := validated.Validate(); err != nil {
+				return nil, fmt.Errorf("evidence[%d]: %w", idx, err)
+			}
+			out = append(out, validated)
+			continue
+		}
+
 		itemNum := ev.ItemNumber
 		if itemNum <= 0 {
-			itemNum = item.Number
+			return nil, fmt.Errorf("evidence[%d]: item_number must be positive, got %d", idx, itemNum)
 		}
-
-		isComment := kindStr == string(domain.EvidenceSourceComment) || commentID != ""
-		if isComment {
-			var matchedComment *domain.Comment
-			if commentID != "" {
-				if cm, ok := commentsByID[commentID]; ok {
-					cp := cm
-					matchedComment = &cp
-				}
-			}
-			if matchedComment == nil && excerpt != "" && len(comments) > 0 {
-				lowerExcerpt := strings.ToLower(excerpt)
-				for i := range comments {
-					if strings.Contains(strings.ToLower(comments[i].Body), lowerExcerpt) {
-						cp := comments[i]
-						matchedComment = &cp
-						break
-					}
-				}
-			}
-			if matchedComment == nil && commentID == "" && len(comments) > 0 {
-				cp := comments[0]
-				matchedComment = &cp
-			}
-
-			if matchedComment != nil {
-				commentID = strings.TrimSpace(matchedComment.CommentID)
-				if matchedComment.ItemNumber > 0 {
-					itemNum = matchedComment.ItemNumber
-				}
-				if strings.TrimSpace(ev.Author) == "" {
-					ev.Author = matchedComment.Author
-				}
-				if strings.TrimSpace(ev.URL) == "" {
-					ev.URL = matchedComment.URL
-				}
-				if excerpt == "" {
-					excerpt = DefaultCommentExcerpt(*matchedComment)
-				}
-			}
-
-			if commentID != "" && excerpt != "" && itemNum > 0 {
-				out = append(out, domain.EvidenceRef{
-					SourceKind: domain.EvidenceSourceComment,
-					ItemNumber: itemNum,
-					CommentID:  commentID,
-					Author:     strings.TrimSpace(ev.Author),
-					Excerpt:    excerpt,
-					URL:        strings.TrimSpace(ev.URL),
-				})
-				continue
-			}
-		}
-
 		refItem, hasRefItem := itemsByNum[itemNum]
 		if !hasRefItem {
-			refItem = item
-			itemNum = item.Number
+			return nil, fmt.Errorf("evidence[%d]: unknown item_number #%d (must be analyzed item #%d or a candidate thread member item)", idx, itemNum, item.Number)
 		}
 		author := strings.TrimSpace(ev.Author)
 		if author == "" {
@@ -214,31 +231,20 @@ func GroundEvidenceRefs(
 		if urlStr == "" {
 			urlStr = refItem.URL
 		}
-		if excerpt == "" {
-			excerpt = DefaultItemExcerpt(refItem)
-		}
-		if excerpt != "" && itemNum > 0 {
-			out = append(out, domain.EvidenceRef{
-				SourceKind: domain.EvidenceSourceItemBody,
-				ItemNumber: itemNum,
-				Author:     author,
-				Excerpt:    excerpt,
-				URL:        urlStr,
-			})
-		}
-	}
-
-	if len(out) == 0 && item.Number > 0 {
-		out = append(out, domain.EvidenceRef{
+		validated := domain.EvidenceRef{
 			SourceKind: domain.EvidenceSourceItemBody,
-			ItemNumber: item.Number,
-			Author:     strings.TrimSpace(item.Author),
-			Excerpt:    DefaultItemExcerpt(item),
-			URL:        strings.TrimSpace(item.URL),
-		})
+			ItemNumber: itemNum,
+			Author:     author,
+			Excerpt:    excerpt,
+			URL:        urlStr,
+		}
+		if err := validated.Validate(); err != nil {
+			return nil, fmt.Errorf("evidence[%d]: %w", idx, err)
+		}
+		out = append(out, validated)
 	}
 
-	return out
+	return out, nil
 }
 
 // DefaultItemExcerpt builds a non-empty source excerpt from an item's body or title.
@@ -278,9 +284,6 @@ func DetectExplicitLink(
 		texts = append(texts, cm.Body)
 	}
 	itemRefs := ExtractReferencedItemNumbers(repo, texts...)
-	if len(itemRefs) == 0 {
-		return false
-	}
 
 	for _, member := range threadItems {
 		if member.Number <= 0 || member.Number == item.Number {
@@ -289,6 +292,16 @@ func DetectExplicitLink(
 		if _, ok := itemRefs[member.Number]; ok {
 			return true
 		}
+		if item.Number > 0 {
+			memberRefs := ExtractReferencedItemNumbers(repo, member.Title, member.Body)
+			if _, ok := memberRefs[item.Number]; ok {
+				return true
+			}
+		}
+	}
+
+	if len(itemRefs) == 0 {
+		return false
 	}
 
 	for _, ev := range evidence {

@@ -22,7 +22,7 @@ import (
 
 const (
 	maxRequestBodyBytes = 1 << 20
-	shutdownGracePeriod = 5 * time.Second
+	shutdownGracePeriod = 10 * time.Second
 )
 
 // Envelope is the JSON response envelope returned by all HTTP API endpoints.
@@ -31,12 +31,6 @@ type Envelope struct {
 	Command string        `json:"command"`
 	Data    any           `json:"data,omitempty"`
 	Error   *domain.Error `json:"error,omitempty"`
-}
-
-// ItemDetail bundles an Item with its chronologically ordered Comments.
-type ItemDetail struct {
-	Item     domain.Item      `json:"item"`
-	Comments []domain.Comment `json:"comments"`
 }
 
 // Server wraps the application Service and embedded frontend assets as an http.Handler.
@@ -123,9 +117,8 @@ func ListenAndServe(
 	httpSrv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		BaseContext: func(net.Listener) context.Context {
-			return ctx
-		},
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
@@ -143,7 +136,15 @@ func ListenAndServe(
 		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
 		defer cancel()
 		if shutErr := httpSrv.Shutdown(shutCtx); shutErr != nil {
-			_ = httpSrv.Close()
+			if closeErr := httpSrv.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+				return domain.NewError(
+					domain.ErrorCodeInternal,
+					"serve",
+					fmt.Sprintf("HTTP server close failed after shutdown timeout: %v", closeErr),
+					"Inspect server logs and open connections.",
+					closeErr,
+				)
+			}
 		}
 		<-errCh
 		return nil
@@ -227,7 +228,7 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, cleanPath stri
 		}
 		writeAPISuccess(w, http.StatusOK, "status", rep)
 
-	case subPath == "/repositories":
+	case subPath == "/repositories" || subPath == "/repos":
 		if !requireMethod(w, r, "repositories.list", http.MethodGet, http.MethodHead) {
 			return
 		}
@@ -252,6 +253,18 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, cleanPath stri
 			return
 		}
 		writeAPISuccess(w, http.StatusOK, "stats", stats)
+
+	case subPath == "/graph":
+		if !requireMethod(w, r, "graph", http.MethodGet, http.MethodHead) {
+			return
+		}
+		repo := queryRepo(r)
+		graph, err := s.svc.Graph(reqCtx, repo)
+		if err != nil {
+			writeAPIError(w, "graph", err)
+			return
+		}
+		writeAPISuccess(w, http.StatusOK, "graph", graph)
 
 	case subPath == "/sync":
 		if !requireMethod(w, r, "sync", http.MethodPost) {
@@ -368,7 +381,7 @@ func writeNotFoundAPIError(w http.ResponseWriter, cleanPath string) {
 		domain.ErrorCodeNotFound,
 		"serve",
 		fmt.Sprintf("API endpoint %q was not found.", cleanPath),
-		"Inspect supported endpoints under /api/status, /api/sync, /api/analyze, /api/threads, /api/relationships, /api/items, and /api/stats.",
+		"Inspect supported endpoints under /api/status, /api/repositories, /api/sync, /api/analyze, /api/threads, /api/relationships, /api/items, /api/stats, and /api/graph.",
 		nil,
 	))
 }
@@ -664,7 +677,7 @@ func (s *Server) handleGetItem(w http.ResponseWriter, r *http.Request, ctx conte
 	if comments == nil {
 		comments = []domain.Comment{}
 	}
-	writeAPISuccess(w, http.StatusOK, "items.show", ItemDetail{
+	writeAPISuccess(w, http.StatusOK, "items.show", domain.ItemDetail{
 		Item:     item,
 		Comments: comments,
 	})
@@ -871,17 +884,21 @@ func (s *Server) serveStaticUI(w http.ResponseWriter, r *http.Request, cleanPath
 	}
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
-		_, _ = w.Write(data)
+		if _, writeErr := w.Write(data); writeErr != nil {
+			return
+		}
 	}
 }
 
-func (s *Server) readEmbeddedAsset(relPath string) ([]byte, string, error) {
+func (s *Server) readEmbeddedAsset(relPath string) (data []byte, contentType string, retErr error) {
 	f, err := s.distFS.Open(relPath)
 	if err != nil {
 		return nil, "", err
 	}
 	defer func() {
-		_ = f.Close()
+		if closeErr := f.Close(); closeErr != nil && retErr == nil {
+			retErr = closeErr
+		}
 	}()
 	info, err := f.Stat()
 	if err != nil {
@@ -890,13 +907,13 @@ func (s *Server) readEmbeddedAsset(relPath string) ([]byte, string, error) {
 	if info.IsDir() {
 		return nil, "", fs.ErrNotExist
 	}
-	data, err := io.ReadAll(f)
+	data, err = io.ReadAll(f)
 	if err != nil {
 		return nil, "", err
 	}
 
 	ext := strings.ToLower(path.Ext(relPath))
-	contentType := mime.TypeByExtension(ext)
+	contentType = mime.TypeByExtension(ext)
 	switch ext {
 	case ".html":
 		contentType = "text/html; charset=utf-8"
@@ -980,11 +997,13 @@ func writeAPISuccess(w http.ResponseWriter, statusCode int, command string, data
 	w.WriteHeader(statusCode)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(Envelope{
+	if err := enc.Encode(Envelope{
 		OK:      true,
 		Command: command,
 		Data:    data,
-	})
+	}); err != nil {
+		return
+	}
 }
 
 func writeAPIError(w http.ResponseWriter, command string, err error) {
@@ -997,11 +1016,13 @@ func writeAPIErrorWithStatus(w http.ResponseWriter, statusCode int, command stri
 	w.WriteHeader(statusCode)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(Envelope{
+	if err := enc.Encode(Envelope{
 		OK:      false,
 		Command: command,
 		Error:   domErr,
-	})
+	}); err != nil {
+		return
+	}
 }
 
 func httpStatusForError(err *domain.Error) int {

@@ -59,8 +59,10 @@ func writeHumanStatus(w io.Writer, rep app.StatusReport) {
 	fmt.Fprintf(w, "  listen_addr:      %s\n", rep.Config.ListenAddr)
 	fmt.Fprintf(w, "  timeout:          %s\n", rep.Config.Timeout)
 	fmt.Fprintf(w, "  github_token_set: %t\n", rep.Config.GitHubTokenSet)
+	fmt.Fprintf(w, "  llm_provider:     %s\n", rep.Config.LLMProvider)
 	fmt.Fprintf(w, "  llm_api_key_set:  %t\n", rep.Config.LLMAPIKeySet)
-	fmt.Fprintf(w, "  llm_model:        %s\n\n", rep.Config.LLMModel)
+	fmt.Fprintf(w, "  llm_model:        %s\n", rep.Config.LLMModel)
+	fmt.Fprintf(w, "  llm_base_url:     %s\n\n", rep.Config.LLMBaseURL)
 
 	fmt.Fprintf(w, "Adapters:\n")
 	fmt.Fprintf(w, "  storage:               %t (schema v%d)\n", rep.Adapters.Storage, rep.SchemaVersion)
@@ -143,4 +145,57 @@ func writeHumanStats(w io.Writer, st domain.RepoStats) {
 	fmt.Fprintf(w, "  verified_relationships_count:    %d\n", st.VerifiedRelationshipsCount)
 	fmt.Fprintf(w, "  non_obvious_relationships_count: %d\n", st.NonObviousRelationshipsCount)
 	fmt.Fprintf(w, "  multi_thread_items_count:        %d\n", st.MultiThreadItemsCount)
+	if len(st.RepeatedProblems) > 0 {
+		fmt.Fprintf(w, "  repeated_problems:               %d\n", len(st.RepeatedProblems))
+	}
+	if len(st.UnresolvedItems) > 0 {
+		fmt.Fprintf(w, "  unresolved_items:                %d\n", len(st.UnresolvedItems))
+	}
+}
+
+func writeHumanItems(w io.Writer, items []domain.Item) {
+	if len(items) == 0 {
+		fmt.Fprintln(w, "No items found.")
+		return
+	}
+	for _, item := range items {
+		fmt.Fprintf(w, "#%d [%s/%s] dirty=%t %s\n", item.Number, item.Kind, item.State, item.IsDirty(), item.Title)
+	}
+}
+
+func writeHumanItemDetail(w io.Writer, detail domain.ItemDetail) {
+	it := detail.Item
+	fmt.Fprintf(w, "Item #%d: %s\n", it.Number, it.Title)
+	fmt.Fprintf(w, "  Repository: %s\n", it.Repository)
+	fmt.Fprintf(w, "  Kind/State: %s / %s\n", it.Kind, it.State)
+	fmt.Fprintf(w, "  Author:     %s\n", it.Author)
+	fmt.Fprintf(w, "  Dirty:      %t\n", it.IsDirty())
+	if it.URL != "" {
+		fmt.Fprintf(w, "  URL:        %s\n", it.URL)
+	}
+	fmt.Fprintf(w, "\nComments (%d):\n", len(detail.Comments))
+	for _, c := range detail.Comments {
+		fmt.Fprintf(w, "  [%s] @%s (%s): %s\n", c.CommentID, c.Author, c.CreatedAt.Format("2006-01-02T15:04:05Z07:00"), c.Body)
+	}
+}
+
+func writeHumanGraph(w io.Writer, g domain.GraphView) {
+	fmt.Fprintf(w, "Repository graph for %s\n", g.Repository)
+	fmt.Fprintf(w, "  threads:       %d\n", len(g.Threads))
+	fmt.Fprintf(w, "  items:         %d\n", len(g.Items))
+	fmt.Fprintf(w, "  relationships: %d\n", len(g.Relationships))
+}
+
+func writeHumanRepositories(w io.Writer, repos []domain.SyncWatermark) {
+	if len(repos) == 0 {
+		fmt.Fprintln(w, "No repositories found.")
+		return
+	}
+	for _, r := range repos {
+		synced := "(never)"
+		if r.LastSyncedAt != nil {
+			synced = r.LastSyncedAt.Format("2006-01-02T15:04:05Z07:00")
+		}
+		fmt.Fprintf(w, "%s\titems=%d\tcomments=%d\tlast_synced_at=%s\n", r.Repository, r.ItemCount, r.CommentCount, synced)
+	}
 }

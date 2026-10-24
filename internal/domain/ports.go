@@ -143,6 +143,7 @@ type Store interface {
 	VerifyRelationship(ctx context.Context, id RelationshipID, verified bool) (Relationship, error)
 	SaveItemAnalysis(ctx context.Context, record ItemAnalysisRecord) error
 	GetRepoStats(ctx context.Context, repo string) (RepoStats, error)
+	GetGraph(ctx context.Context, repo string) (GraphView, error)
 	Close() error
 }
 

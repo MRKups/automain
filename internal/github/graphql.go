@@ -375,12 +375,24 @@ func (c *Client) fetchDiscussions(
 			Variables: vars,
 		})
 		if err != nil {
-			return nil, false, []string{fmt.Sprintf("Failed to encode GraphQL discussions request: %v", err)}, nil
+			return nil, false, nil, domain.NewError(
+				domain.ErrorCodeInternal,
+				"sync",
+				fmt.Sprintf("Failed to encode GraphQL discussions request: %v", err),
+				"Verify GraphQL request variables.",
+				err,
+			)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.graphQLURL, bytes.NewReader(payloadBytes))
 		if err != nil {
-			return nil, false, []string{fmt.Sprintf("Failed to construct GraphQL request: %v", err)}, nil
+			return nil, false, nil, domain.NewError(
+				domain.ErrorCodeInternal,
+				"sync",
+				fmt.Sprintf("Failed to construct GraphQL request: %v", err),
+				"Verify the GitHub GraphQL URL configuration.",
+				err,
+			)
 		}
 		req.Header.Set("Authorization", "Bearer "+c.token)
 		req.Header.Set("Content-Type", "application/json")
@@ -392,31 +404,72 @@ func (c *Client) fetchDiscussions(
 			if ctx.Err() != nil {
 				return nil, false, nil, domain.AsError("sync", ctx.Err())
 			}
-			return nil, false, []string{fmt.Sprintf("GitHub Discussions GraphQL request failed: %v", err)}, nil
+			return nil, false, nil, domain.NewError(
+				domain.ErrorCodeExternalUnavailable,
+				"sync",
+				fmt.Sprintf("GitHub Discussions GraphQL request failed for %q: %v", repo, err),
+				"Check network connectivity and GitHub GraphQL availability, or increase --timeout.",
+				err,
+			)
 		}
 
 		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
+		drainAndCloseBody(resp.Body)
 
 		if readErr != nil {
-			return nil, false, []string{fmt.Sprintf("Failed to read GitHub Discussions GraphQL response: %v", readErr)}, nil
+			return nil, false, nil, domain.NewError(
+				domain.ErrorCodeExternalUnavailable,
+				"sync",
+				fmt.Sprintf("Failed to read GitHub Discussions GraphQL response for %q: %v", repo, readErr),
+				"Retry synchronization or inspect network stability.",
+				readErr,
+			)
 		}
 
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotImplemented {
 			return nil, false, []string{fmt.Sprintf("Skipped GitHub Discussions sync (GraphQL endpoint returned HTTP %d).", resp.StatusCode)}, nil
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, false, nil, mapHTTPError(resp.StatusCode, resp.Header, bodyBytes, repo, c.token != "")
 		}
 
 		var gqlResp graphQLResponse
 		if err := json.Unmarshal(bodyBytes, &gqlResp); err != nil {
-			return nil, false, []string{fmt.Sprintf("Skipped GitHub Discussions sync (invalid GraphQL response: %v).", err)}, nil
+			return nil, false, nil, domain.NewError(
+				domain.ErrorCodeExternalUnavailable,
+				"sync",
+				fmt.Sprintf("Invalid GitHub Discussions GraphQL response for %q: %v", repo, err),
+				"Verify GitHub GraphQL API availability and response format.",
+				err,
+			)
 		}
 
 		if len(gqlResp.Errors) > 0 {
 			msgs := make([]string, 0, len(gqlResp.Errors))
 			for _, ge := range gqlResp.Errors {
-				if trimmed := strings.TrimSpace(ge.Message); trimmed != "" {
-					msgs = append(msgs, trimmed)
+				errType := strings.ToUpper(strings.TrimSpace(ge.Type))
+				trimmedMsg := strings.TrimSpace(ge.Message)
+				lowerMsg := strings.ToLower(trimmedMsg)
+				if errType == "RATE_LIMITED" || strings.Contains(lowerMsg, "rate limit") {
+					return nil, false, nil, domain.NewError(
+						domain.ErrorCodeExternalUnavailable,
+						"sync",
+						fmt.Sprintf("GitHub GraphQL rate limit exceeded for %q: %s", repo, trimmedMsg),
+						"Wait for the GitHub GraphQL rate limit window to reset or pass a smaller --limit.",
+						nil,
+					)
+				}
+				if errType == "FORBIDDEN" || errType == "INSUFFICIENT_SCOPES" || strings.Contains(lowerMsg, "bad credentials") || strings.Contains(lowerMsg, "unauthorized") {
+					return nil, false, nil, domain.NewError(
+						domain.ErrorCodeExternalUnavailable,
+						"sync",
+						fmt.Sprintf("GitHub GraphQL authorization failed for %q: %s", repo, trimmedMsg),
+						"Ensure GITHUB_TOKEN is valid and has read permissions for repository discussions.",
+						nil,
+					)
+				}
+				if trimmedMsg != "" {
+					msgs = append(msgs, trimmedMsg)
 				}
 			}
 			joined := strings.Join(msgs, "; ")
@@ -551,12 +604,24 @@ func (c *Client) fetchAdditionalDiscussionComments(
 			},
 		})
 		if err != nil {
-			break
+			return nil, domain.NewError(
+				domain.ErrorCodeInternal,
+				"sync",
+				fmt.Sprintf("Failed to encode discussion comments GraphQL request for #%d: %v", discussionNumber, err),
+				"Verify GraphQL request variables.",
+				err,
+			)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.graphQLURL, bytes.NewReader(payloadBytes))
 		if err != nil {
-			break
+			return nil, domain.NewError(
+				domain.ErrorCodeInternal,
+				"sync",
+				fmt.Sprintf("Failed to construct discussion comments GraphQL request for #%d: %v", discussionNumber, err),
+				"Verify the GitHub GraphQL URL configuration.",
+				err,
+			)
 		}
 		req.Header.Set("Authorization", "Bearer "+c.token)
 		req.Header.Set("Content-Type", "application/json")
@@ -568,18 +633,38 @@ func (c *Client) fetchAdditionalDiscussionComments(
 			if ctx.Err() != nil {
 				return nil, domain.AsError("sync", ctx.Err())
 			}
-			break
+			return nil, domain.NewError(
+				domain.ErrorCodeExternalUnavailable,
+				"sync",
+				fmt.Sprintf("GitHub discussion comments GraphQL request failed for %s/%s#%d: %v", owner, repoName, discussionNumber, err),
+				"Check network connectivity and GitHub GraphQL availability.",
+				err,
+			)
 		}
 		bodyBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		if readErr != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			break
+		drainAndCloseBody(resp.Body)
+		if readErr != nil {
+			return nil, domain.NewError(
+				domain.ErrorCodeExternalUnavailable,
+				"sync",
+				fmt.Sprintf("Failed to read discussion comments GraphQL response for %s/%s#%d: %v", owner, repoName, discussionNumber, readErr),
+				"Retry synchronization or inspect network stability.",
+				readErr,
+			)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, mapHTTPError(resp.StatusCode, resp.Header, bodyBytes, owner+"/"+repoName, c.token != "")
 		}
 
 		var gqlResp graphQLResponse
 		if err := json.Unmarshal(bodyBytes, &gqlResp); err != nil {
-			break
+			return nil, domain.NewError(
+				domain.ErrorCodeExternalUnavailable,
+				"sync",
+				fmt.Sprintf("Invalid discussion comments GraphQL response for %s/%s#%d: %v", owner, repoName, discussionNumber, err),
+				"Verify GitHub GraphQL API availability and response format.",
+				err,
+			)
 		}
 		if gqlResp.Data == nil || gqlResp.Data.Repository == nil || gqlResp.Data.Repository.Discussion == nil || gqlResp.Data.Repository.Discussion.Comments == nil {
 			break

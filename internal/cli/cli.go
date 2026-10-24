@@ -39,7 +39,7 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 			domain.ErrorCodeInvalidInput,
 			"cli",
 			"Subcommand is required.",
-			"Run 'automain --help' to list supported commands: status, sync, analyze, threads, relationships, stats, serve, version.",
+			"Run 'automain --help' to list supported commands: status, sync, items, analyze, threads, relationships, stats, graph, repositories, serve, version.",
 			nil,
 		))
 	}
@@ -89,6 +89,8 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 		return runStatus(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "sync":
 		return runSync(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+	case "items":
+		return runItems(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "analyze":
 		return runAnalyze(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "threads":
@@ -97,6 +99,10 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 		return runRelationships(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "stats":
 		return runStats(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+	case "graph":
+		return runGraph(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+	case "repositories", "repos":
+		return runRepositories(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "serve":
 		return runServe(ctx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	default:
@@ -104,7 +110,7 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 			domain.ErrorCodeInvalidInput,
 			subcmd,
 			fmt.Sprintf("Unknown command %q.", subcmd),
-			"Run 'automain --help' to list supported commands: status, sync, analyze, threads, relationships, stats, serve, version.",
+			"Run 'automain --help' to list supported commands: status, sync, items, analyze, threads, relationships, stats, graph, repositories, serve, version.",
 			nil,
 		))
 	}
@@ -265,6 +271,7 @@ func runAnalyze(ctx context.Context, factory ServiceFactory, cfg config.Config, 
 		ItemNumber: *itemNum,
 		Limit:      *limit,
 		Reanalyze:  *reanalyze,
+		Finder:     cfg.Finder,
 	})
 	if err != nil {
 		return writeError(stdout, stderr, jsonMode, "analyze", err)
@@ -277,6 +284,186 @@ func runAnalyze(ctx context.Context, factory ServiceFactory, cfg config.Config, 
 	}
 	writeHumanAnalyzeResult(stdout, res)
 	return 0
+}
+
+func runItems(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
+	action := "list"
+	rest := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		action = args[0]
+		rest = args[1:]
+	}
+
+	switch action {
+	case "list":
+		if helpRequested {
+			fmt.Fprintln(stdout, "Usage: automain items [list] --repo <owner/name> [--kind issue|pull_request|discussion] [--state open|closed|merged|answered] [--dirty [true|false]] [--limit <n>] [--json]")
+			return 0
+		}
+		normalizedRest := normalizeBoolFlagArgs(rest, "dirty")
+		fs := newSubFlagSet("items list")
+		kind := fs.String("kind", "", "Filter items by kind (issue|pull_request|discussion)")
+		state := fs.String("state", "", "Filter items by state (open|closed|merged|answered)")
+		dirty := fs.Bool("dirty", false, "Filter items by dirty analysis state")
+		limit := fs.Int("limit", 0, "Maximum number of items to return")
+		if err := parseSubcommandFlags(fs, "items.list", normalizedRest, "Run 'automain items --help' for usage."); err != nil {
+			return writeError(stdout, stderr, jsonMode, "items.list", err)
+		}
+		if err := validateCLIRequiredRepo("items.list", cfg.Repository); err != nil {
+			return writeError(stdout, stderr, jsonMode, "items.list", err)
+		}
+		kindVal := domain.ItemKind(strings.TrimSpace(*kind))
+		if kindVal != "" {
+			if err := kindVal.Validate(); err != nil {
+				return writeError(stdout, stderr, jsonMode, "items.list", domain.NewError(
+					domain.ErrorCodeInvalidInput,
+					"items.list",
+					err.Error(),
+					"Use --kind issue, --kind pull_request, or --kind discussion.",
+					err,
+				))
+			}
+		}
+		stateVal := domain.ItemState(strings.TrimSpace(*state))
+		if stateVal != "" {
+			if err := stateVal.Validate(); err != nil {
+				return writeError(stdout, stderr, jsonMode, "items.list", domain.NewError(
+					domain.ErrorCodeInvalidInput,
+					"items.list",
+					err.Error(),
+					"Use --state open, --state closed, --state merged, or --state answered.",
+					err,
+				))
+			}
+		}
+		if *limit < 0 {
+			return writeError(stdout, stderr, jsonMode, "items.list", domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"items.list",
+				"Item limit (--limit) must not be negative.",
+				"Pass a non-negative integer for --limit or omit it.",
+				nil,
+			))
+		}
+		var dirtyPtr *bool
+		if flagWasSet(fs, "dirty") {
+			b := *dirty
+			dirtyPtr = &b
+		}
+
+		svc, cleanup, err := factory(ctx, cfg)
+		if err != nil {
+			return writeError(stdout, stderr, jsonMode, "items.list", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+
+		items, err := svc.ListItems(ctx, domain.ItemFilter{
+			Repository: cfg.Repository,
+			Kind:       kindVal,
+			State:      stateVal,
+			DirtyOnly:  dirtyPtr != nil && *dirtyPtr,
+			Dirty:      dirtyPtr,
+			Limit:      *limit,
+		})
+		if err != nil {
+			return writeError(stdout, stderr, jsonMode, "items.list", err)
+		}
+		if items == nil {
+			items = []domain.Item{}
+		}
+		if jsonMode {
+			if err := writeJSONSuccess(stdout, "items.list", items); err != nil {
+				return writeError(stdout, stderr, jsonMode, "items.list", err)
+			}
+			return 0
+		}
+		writeHumanItems(stdout, items)
+		return 0
+
+	case "show":
+		if helpRequested {
+			fmt.Fprintln(stdout, "Usage: automain items show --repo <owner/name> --number <n> [--json]")
+			return 0
+		}
+		fs := newSubFlagSet("items show")
+		number := fs.Int("number", 0, "GitHub item number to inspect")
+		itemAlias := fs.Int("item", 0, "GitHub item number to inspect (alias for --number)")
+		if err := parseSubcommandFlags(fs, "items.show", rest, "Run 'automain items show --help' for usage."); err != nil {
+			return writeError(stdout, stderr, jsonMode, "items.show", err)
+		}
+		if err := validateCLIRequiredRepo("items.show", cfg.Repository); err != nil {
+			return writeError(stdout, stderr, jsonMode, "items.show", err)
+		}
+		targetNum := *number
+		if targetNum == 0 && flagWasSet(fs, "item") {
+			targetNum = *itemAlias
+		}
+		if targetNum <= 0 {
+			return writeError(stdout, stderr, jsonMode, "items.show", domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"items.show",
+				"Item number (--number) must be a positive integer.",
+				"Pass a positive GitHub item number via --number <n>.",
+				nil,
+			))
+		}
+
+		svc, cleanup, err := factory(ctx, cfg)
+		if err != nil {
+			return writeError(stdout, stderr, jsonMode, "items.show", err)
+		}
+		if cleanup != nil {
+			defer cleanup()
+		}
+
+		item, comments, err := svc.GetItem(ctx, cfg.Repository, targetNum)
+		if err != nil {
+			return writeError(stdout, stderr, jsonMode, "items.show", err)
+		}
+		if comments == nil {
+			comments = []domain.Comment{}
+		}
+		detail := domain.ItemDetail{
+			Item:     item,
+			Comments: comments,
+		}
+		if jsonMode {
+			if err := writeJSONSuccess(stdout, "items.show", detail); err != nil {
+				return writeError(stdout, stderr, jsonMode, "items.show", err)
+			}
+			return 0
+		}
+		writeHumanItemDetail(stdout, detail)
+		return 0
+
+	default:
+		return writeError(stdout, stderr, jsonMode, "items", domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"items",
+			fmt.Sprintf("Unknown items subcommand %q.", action),
+			"Supported subcommands: 'automain items list' and 'automain items show --number <n>'.",
+			nil,
+		))
+	}
+}
+
+func normalizeBoolFlagArgs(args []string, flagName string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if (arg == "--"+flagName || arg == "-"+flagName) && i+1 < len(args) {
+			next := strings.ToLower(strings.TrimSpace(args[i+1]))
+			if next == "true" || next == "false" || next == "1" || next == "0" {
+				out = append(out, arg+"="+next)
+				i++
+				continue
+			}
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 func runThreads(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
@@ -620,6 +807,101 @@ func runStats(ctx context.Context, factory ServiceFactory, cfg config.Config, ar
 	return 0
 }
 
+func runGraph(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
+	if helpRequested {
+		fmt.Fprintln(stdout, "Usage: automain graph --repo <owner/name> [--json]")
+		return 0
+	}
+	if len(args) > 0 {
+		return writeError(stdout, stderr, jsonMode, "graph", domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"graph",
+			fmt.Sprintf("Unexpected argument %q for graph.", args[0]),
+			"Run 'automain graph --repo <owner/name> [--json]'.",
+			nil,
+		))
+	}
+	if err := validateCLIRequiredRepo("graph", cfg.Repository); err != nil {
+		return writeError(stdout, stderr, jsonMode, "graph", err)
+	}
+
+	svc, cleanup, err := factory(ctx, cfg)
+	if err != nil {
+		return writeError(stdout, stderr, jsonMode, "graph", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	g, err := svc.Graph(ctx, cfg.Repository)
+	if err != nil {
+		return writeError(stdout, stderr, jsonMode, "graph", err)
+	}
+	if jsonMode {
+		if err := writeJSONSuccess(stdout, "graph", g); err != nil {
+			return writeError(stdout, stderr, jsonMode, "graph", err)
+		}
+		return 0
+	}
+	writeHumanGraph(stdout, g)
+	return 0
+}
+
+func runRepositories(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
+	action := "list"
+	rest := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		action = args[0]
+		rest = args[1:]
+	}
+	if action != "list" {
+		return writeError(stdout, stderr, jsonMode, "repositories.list", domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"repositories.list",
+			fmt.Sprintf("Unknown repositories subcommand %q.", action),
+			"Run 'automain repositories [list] [--json]'.",
+			nil,
+		))
+	}
+	if helpRequested {
+		fmt.Fprintln(stdout, "Usage: automain repositories [list] [--db <path>] [--json]")
+		return 0
+	}
+	if len(rest) > 0 {
+		return writeError(stdout, stderr, jsonMode, "repositories.list", domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"repositories.list",
+			fmt.Sprintf("Unexpected argument %q for repositories.", rest[0]),
+			"Run 'automain repositories [list] [--json]'.",
+			nil,
+		))
+	}
+
+	svc, cleanup, err := factory(ctx, cfg)
+	if err != nil {
+		return writeError(stdout, stderr, jsonMode, "repositories.list", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	repos, err := svc.ListRepositories(ctx)
+	if err != nil {
+		return writeError(stdout, stderr, jsonMode, "repositories.list", err)
+	}
+	if repos == nil {
+		repos = []domain.SyncWatermark{}
+	}
+	if jsonMode {
+		if err := writeJSONSuccess(stdout, "repositories.list", repos); err != nil {
+			return writeError(stdout, stderr, jsonMode, "repositories.list", err)
+		}
+		return 0
+	}
+	writeHumanRepositories(stdout, repos)
+	return 0
+}
+
 func runServe(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
 	if helpRequested {
 		fmt.Fprintln(stdout, "Usage: automain serve [--listen <host:port>] [--db <path>] [--repo <owner/name>] [--json]")
@@ -658,13 +940,15 @@ func runServe(ctx context.Context, factory ServiceFactory, cfg config.Config, ar
 	onListen := func(addr net.Addr) {
 		boundAddr := addr.String()
 		if jsonMode {
-			_ = writeJSONSuccess(stdout, "serve", map[string]any{
+			if encErr := writeJSONSuccess(stdout, "serve", map[string]any{
 				"listen_addr": boundAddr,
 				"url":         "http://" + boundAddr,
 				"db_path":     cfg.DBPath,
 				"repository":  cfg.Repository,
 				"ui_embedded": web.HasIndex(),
-			})
+			}); encErr != nil {
+				fmt.Fprintf(stderr, "error encoding json response: %v\n", encErr)
+			}
 			return
 		}
 		fmt.Fprintf(stdout, "Listening on http://%s (db: %s, ui_embedded: %t)\n", boundAddr, cfg.DBPath, web.HasIndex())
@@ -801,10 +1085,13 @@ func isSignedInteger(s string) bool {
 func detectJSONFlag(args []string) bool {
 	jsonMode := false
 	for _, a := range args {
-		switch a {
-		case "--json", "-json", "--json=true", "-json=true":
+		if a == "--" {
+			break
+		}
+		switch strings.ToLower(a) {
+		case "--json", "-json", "--json=true", "-json=true", "--json=1", "-json=1":
 			jsonMode = true
-		case "--json=false", "-json=false":
+		case "--json=false", "-json=false", "--json=0", "-json=0":
 			jsonMode = false
 		}
 	}
@@ -820,13 +1107,28 @@ func extractGlobalFlags(base config.Config, args []string) (config.Config, []str
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
+		if arg == "--" {
+			remaining = append(remaining, args[i:]...)
+			break
+		}
+		lowerArg := strings.ToLower(arg)
 		switch {
 		case arg == "-h" || arg == "--help":
 			helpRequested = true
-		case arg == "--json" || arg == "-json" || arg == "--json=true" || arg == "-json=true":
+		case lowerArg == "--json" || lowerArg == "-json" || lowerArg == "--json=true" || lowerArg == "-json=true" || lowerArg == "--json=1" || lowerArg == "-json=1":
 			cfg.JSONOutput = true
-		case arg == "--json=false" || arg == "-json=false":
+		case lowerArg == "--json=false" || lowerArg == "-json=false" || lowerArg == "--json=0" || lowerArg == "-json=0":
 			cfg.JSONOutput = false
+		case hasFlagValuePrefix(lowerArg, "json"):
+			eqIdx := strings.IndexByte(arg, '=')
+			val := arg[eqIdx+1:]
+			return cfg, nil, false, domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"cli",
+				fmt.Sprintf("Invalid --json boolean value %q; expected true, false, 1, or 0.", val),
+				"Pass --json, --json=true, or --json=false.",
+				nil,
+			)
 		case arg == "--db" || arg == "-db":
 			val, next, err := consumeValue("--db", args, i)
 			if err != nil {
@@ -979,10 +1281,13 @@ Usage:
 Commands:
   status          Show configuration, database path, and wired adapter status
   sync            Import and incrementally update items from a GitHub repository
+  items           List repository items or inspect an item with comments (list|show)
   analyze         Classify items, find candidate threads, and verify relationships
   threads         List threads or inspect a thread and its member items (list|show)
   relationships   List, inspect, or verify item-to-thread relationships (list|show|verify)
   stats           Calculate repository activity and relationship graph statistics
+  graph           Export the full repository thread-item relationship network
+  repositories    List repositories and sync watermarks stored in SQLite
   serve           Start the HTTP JSON API and embedded web UI server
   version         Print binary version
 

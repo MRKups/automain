@@ -30,8 +30,10 @@ type StatusConfig struct {
 	ListenAddr     string `json:"listen_addr"`
 	Timeout        string `json:"timeout"`
 	GitHubTokenSet bool   `json:"github_token_set"`
+	LLMProvider    string `json:"llm_provider"`
 	LLMAPIKeySet   bool   `json:"llm_api_key_set"`
 	LLMModel       string `json:"llm_model"`
+	LLMBaseURL     string `json:"llm_base_url,omitempty"`
 }
 
 // AdapterStatus reports which effect ports are wired in the current binary composition.
@@ -85,8 +87,10 @@ func (s *Service) Status(ctx context.Context) (StatusReport, error) {
 			ListenAddr:     s.cfg.ListenAddr,
 			Timeout:        s.cfg.Timeout.String(),
 			GitHubTokenSet: s.cfg.GitHubTokenSet(),
+			LLMProvider:    config.NormalizeLLMProvider(s.cfg.LLMProvider),
 			LLMAPIKeySet:   s.cfg.LLMAPIKeySet(),
 			LLMModel:       s.cfg.LLMModel,
+			LLMBaseURL:     s.cfg.LLMBaseURL,
 		},
 		Adapters: AdapterStatus{
 			Storage:              s.adapters.Store != nil,
@@ -133,15 +137,14 @@ func (s *Service) Sync(ctx context.Context, opts domain.SyncOptions) (domain.Syn
 	defer s.mu.Unlock()
 
 	opts.Repository = repo
-	var since *time.Time
-	if opts.Since != nil {
-		since = opts.Since
-	} else if !opts.Full {
-		wm, err := s.adapters.Store.GetSyncWatermark(ctx, repo)
-		if err != nil {
+	if !opts.Full {
+		if _, err := s.adapters.Store.GetSyncWatermark(ctx, repo); err != nil {
 			return domain.SyncResult{}, domain.AsError("sync", err)
 		}
-		since = wm.LastSyncedAt
+	}
+	var since *time.Time
+	if !opts.Full && opts.Since != nil {
+		since = opts.Since
 	}
 
 	batch, err := s.adapters.GitHub.FetchUpdates(ctx, opts, since)
@@ -676,6 +679,25 @@ func (s *Service) Stats(ctx context.Context, repoOverride string) (domain.RepoSt
 		return domain.RepoStats{}, domain.AsError("stats", err)
 	}
 	return stats, nil
+}
+
+// Graph returns the full repository thread-item relationship network and analytics view.
+func (s *Service) Graph(ctx context.Context, repoOverride string) (domain.GraphView, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.GraphView{}, domain.AsError("graph", err)
+	}
+	repo := s.resolveRepo(repoOverride)
+	if err := requireRepo("graph", repo); err != nil {
+		return domain.GraphView{}, err
+	}
+	if s.adapters.Store == nil {
+		return domain.GraphView{}, storageNotConfiguredError("graph")
+	}
+	graph, err := s.adapters.Store.GetGraph(ctx, repo)
+	if err != nil {
+		return domain.GraphView{}, domain.AsError("graph", err)
+	}
+	return graph, nil
 }
 
 // ListItems returns repository items matching filter.

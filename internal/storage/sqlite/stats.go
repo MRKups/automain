@@ -28,6 +28,9 @@ func (s *Store) GetRepoStats(ctx context.Context, repo string) (domain.RepoStats
 		ItemsByState:        map[domain.ItemState]int{},
 		ThreadsByStatus:     map[domain.ThreadStatus]int{},
 		RelationshipsByType: map[domain.RelationshipType]int{},
+		RepeatedProblems:    []domain.ProblemThreadStat{},
+		MultiThreadItems:    []domain.ItemSummary{},
+		UnresolvedItems:     []domain.ItemSummary{},
 	}
 
 	if err := s.populateItemStats(ctx, repo, &stats); err != nil {
@@ -39,8 +42,98 @@ func (s *Store) GetRepoStats(ctx context.Context, repo string) (domain.RepoStats
 	if err := s.populateRelationshipStats(ctx, repo, &stats); err != nil {
 		return domain.RepoStats{}, err
 	}
+	if err := s.populateAnalyticsSlices(ctx, repo, &stats); err != nil {
+		return domain.RepoStats{}, err
+	}
 
 	return stats, nil
+}
+
+// GetGraph returns the repository's threads, items with thread counts, and relationships.
+func (s *Store) GetGraph(ctx context.Context, repo string) (domain.GraphView, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.GraphView{}, domain.AsError("graph", err)
+	}
+	if err := domain.ValidateRepoSlug(repo); err != nil {
+		return domain.GraphView{}, domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"graph",
+			err.Error(),
+			"Pass the repository in owner/name format.",
+			err,
+		)
+	}
+
+	threads, err := s.ListThreads(ctx, domain.ThreadFilter{Repository: repo})
+	if err != nil {
+		return domain.GraphView{}, err
+	}
+	if threads == nil {
+		threads = []domain.Thread{}
+	}
+
+	rels, err := s.ListRelationships(ctx, domain.RelationshipFilter{Repository: repo})
+	if err != nil {
+		return domain.GraphView{}, err
+	}
+	if rels == nil {
+		rels = []domain.Relationship{}
+	}
+
+	itemRows, err := s.db.QueryContext(
+		ctx,
+		`SELECT
+			i.repo,
+			i.number,
+			i.kind,
+			i.state,
+			i.title,
+			COALESCE(i.author, ''),
+			COALESCE(i.url, ''),
+			(SELECT COUNT(DISTINCT r.thread_id) FROM relationships r WHERE r.repo = i.repo AND r.item_number = i.number) AS thread_count
+		FROM items i
+		WHERE i.repo = ?
+		ORDER BY i.number ASC`,
+		repo,
+	)
+	if err != nil {
+		return domain.GraphView{}, fmt.Errorf("query graph items for %q: %w", repo, err)
+	}
+	defer closeRows(itemRows)
+
+	items := []domain.ItemSummary{}
+	for itemRows.Next() {
+		var (
+			it       domain.ItemSummary
+			kindStr  string
+			stateStr string
+		)
+		if err := itemRows.Scan(
+			&it.Repository,
+			&it.Number,
+			&kindStr,
+			&stateStr,
+			&it.Title,
+			&it.Author,
+			&it.URL,
+			&it.ThreadCount,
+		); err != nil {
+			return domain.GraphView{}, fmt.Errorf("scan graph item for %q: %w", repo, err)
+		}
+		it.Kind = domain.ItemKind(kindStr)
+		it.State = domain.ItemState(stateStr)
+		items = append(items, it)
+	}
+	if err := itemRows.Err(); err != nil {
+		return domain.GraphView{}, fmt.Errorf("iterate graph items for %q: %w", repo, err)
+	}
+
+	return domain.GraphView{
+		Repository:    repo,
+		Threads:       threads,
+		Items:         items,
+		Relationships: rels,
+	}, nil
 }
 
 func (s *Store) populateItemStats(ctx context.Context, repo string, stats *domain.RepoStats) error {
@@ -185,6 +278,150 @@ func (s *Store) populateRelationshipStats(ctx context.Context, repo string, stat
 	).Scan(&stats.MultiThreadItemsCount); err != nil {
 		return fmt.Errorf("count multi-thread items for %q: %w", repo, err)
 	}
+
+	return nil
+}
+
+func (s *Store) populateAnalyticsSlices(ctx context.Context, repo string, stats *domain.RepoStats) error {
+	problemRows, err := s.db.QueryContext(
+		ctx,
+		`SELECT
+			t.id,
+			t.title,
+			t.status,
+			COUNT(DISTINCT CASE WHEN r.rel_type IN ('reports_same_problem', 'duplicate_of') THEN r.item_number END) AS problem_count,
+			COUNT(DISTINCT r.item_number) AS total_items
+		FROM threads t
+		JOIN relationships r ON r.repo = t.repo AND r.thread_id = t.id
+		WHERE t.repo = ?
+		GROUP BY t.id, t.title, t.status
+		HAVING problem_count > 0
+		ORDER BY problem_count DESC, total_items DESC, t.id ASC
+		LIMIT 10`,
+		repo,
+	)
+	if err != nil {
+		return fmt.Errorf("query repeated problems for %q: %w", repo, err)
+	}
+	for problemRows.Next() {
+		var (
+			p         domain.ProblemThreadStat
+			idStr     string
+			statusStr string
+		)
+		if err := problemRows.Scan(&idStr, &p.Title, &statusStr, &p.ProblemReportCount, &p.TotalItemCount); err != nil {
+			closeRows(problemRows)
+			return fmt.Errorf("scan repeated problem for %q: %w", repo, err)
+		}
+		p.ThreadID = domain.ThreadID(idStr)
+		p.Status = domain.ThreadStatus(statusStr)
+		stats.RepeatedProblems = append(stats.RepeatedProblems, p)
+	}
+	if err := problemRows.Err(); err != nil {
+		closeRows(problemRows)
+		return fmt.Errorf("iterate repeated problems for %q: %w", repo, err)
+	}
+	closeRows(problemRows)
+
+	multiRows, err := s.db.QueryContext(
+		ctx,
+		`SELECT
+			i.repo,
+			i.number,
+			i.kind,
+			i.state,
+			i.title,
+			COALESCE(i.author, ''),
+			COALESCE(i.url, ''),
+			COUNT(DISTINCT r.thread_id) AS thread_count
+		FROM items i
+		JOIN relationships r ON r.repo = i.repo AND r.item_number = i.number
+		WHERE i.repo = ?
+		GROUP BY i.repo, i.number, i.kind, i.state, i.title, i.author, i.url
+		HAVING COUNT(DISTINCT r.thread_id) > 1
+		ORDER BY thread_count DESC, i.number ASC`,
+		repo,
+	)
+	if err != nil {
+		return fmt.Errorf("query multi-thread items for %q: %w", repo, err)
+	}
+	for multiRows.Next() {
+		var (
+			it       domain.ItemSummary
+			kindStr  string
+			stateStr string
+		)
+		if err := multiRows.Scan(&it.Repository, &it.Number, &kindStr, &stateStr, &it.Title, &it.Author, &it.URL, &it.ThreadCount); err != nil {
+			closeRows(multiRows)
+			return fmt.Errorf("scan multi-thread item for %q: %w", repo, err)
+		}
+		it.Kind = domain.ItemKind(kindStr)
+		it.State = domain.ItemState(stateStr)
+		stats.MultiThreadItems = append(stats.MultiThreadItems, it)
+	}
+	if err := multiRows.Err(); err != nil {
+		closeRows(multiRows)
+		return fmt.Errorf("iterate multi-thread items for %q: %w", repo, err)
+	}
+	closeRows(multiRows)
+
+	unresRows, err := s.db.QueryContext(
+		ctx,
+		`SELECT
+			i.repo,
+			i.number,
+			i.kind,
+			i.state,
+			i.title,
+			COALESCE(i.author, ''),
+			COALESCE(i.url, ''),
+			(SELECT COUNT(DISTINCT r2.thread_id) FROM relationships r2 WHERE r2.repo = i.repo AND r2.item_number = i.number) AS thread_count
+		FROM items i
+		WHERE i.repo = ?
+		  AND i.kind IN ('issue', 'discussion')
+		  AND i.state = 'open'
+		  AND EXISTS (
+		      SELECT 1
+		      FROM relationships r
+		      JOIN threads t ON t.repo = r.repo AND t.id = r.thread_id
+		      WHERE r.repo = i.repo
+		        AND r.item_number = i.number
+		        AND t.status = 'active'
+		        AND NOT EXISTS (
+		            SELECT 1
+		            FROM relationships r_fix
+		            JOIN items i_fix ON i_fix.repo = r_fix.repo AND i_fix.number = r_fix.item_number
+		            WHERE r_fix.repo = t.repo
+		              AND r_fix.thread_id = t.id
+		              AND r_fix.rel_type IN ('proposes_fix', 'implements_decision')
+		              AND i_fix.kind = 'pull_request'
+		        )
+		  )
+		ORDER BY i.number ASC`,
+		repo,
+	)
+	if err != nil {
+		return fmt.Errorf("query unresolved items for %q: %w", repo, err)
+	}
+	for unresRows.Next() {
+		var (
+			it       domain.ItemSummary
+			kindStr  string
+			stateStr string
+		)
+		if err := unresRows.Scan(&it.Repository, &it.Number, &kindStr, &stateStr, &it.Title, &it.Author, &it.URL, &it.ThreadCount); err != nil {
+			closeRows(unresRows)
+			return fmt.Errorf("scan unresolved item for %q: %w", repo, err)
+		}
+		it.Kind = domain.ItemKind(kindStr)
+		it.State = domain.ItemState(stateStr)
+		stats.UnresolvedItems = append(stats.UnresolvedItems, it)
+	}
+	if err := unresRows.Err(); err != nil {
+		closeRows(unresRows)
+		return fmt.Errorf("iterate unresolved items for %q: %w", repo, err)
+	}
+	closeRows(unresRows)
 
 	return nil
 }
