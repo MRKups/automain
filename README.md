@@ -9,11 +9,10 @@ persistent threads backed by source evidence.
 Core domain contracts (`internal/domain`), runtime configuration
 (`internal/config`), SQLite persistence (`internal/storage/sqlite`), GitHub
 ingestion (`internal/github`), candidate discovery and relationship analysis
-(`internal/analysis`), application service facade (`internal/app`), embedded
-web asset boundary (`web`), and the `automain` CLI (`cmd/automain`,
-`internal/cli`) for `status`, `version`, `sync`, `analyze`, `threads`,
-`relationships`, and `stats` are implemented. HTTP endpoints (`serve`) and the
-Svelte UI are not wired yet.
+(`internal/analysis`), application service facade (`internal/app`), HTTP API
+server (`internal/server`), embedded Svelte UI (`web`), and the `automain` CLI
+(`cmd/automain`, `internal/cli`) for `status`, `version`, `sync`, `analyze`,
+`threads`, `relationships`, `stats`, and `serve` are implemented.
 
 ## Stack
 
@@ -23,9 +22,12 @@ Svelte UI are not wired yet.
 
 ## Build and Run
 
-Prerequisites: Go 1.24+ and [Task](https://taskfile.dev).
+Prerequisites: Go 1.24+, [Task](https://taskfile.dev), and Node.js 20+ (only when rebuilding `web/dist`).
 
 ```sh
+# Rebuild embedded frontend assets (optional when editing web/src/*)
+task web
+
 # Build bin/automain
 task build
 
@@ -46,8 +48,23 @@ automain analyze --repo <owner/name> [--item <number>] [--limit <n>] [--reanalyz
 automain threads [list|show] [--repo <owner/name>] [--id <thread-id>] [--json]
 automain relationships [list|show|verify] [--repo <owner/name>] [--id <rel-id>] [--json]
 automain stats --repo <owner/name> [--json]
-automain serve [--listen <host:port>] [--db <path>]
+automain serve [--listen <host:port>] [--db <path>] [--repo <owner/name>] [--json]
 ```
+
+### HTTP API (`automain serve`)
+
+- `GET /` serves the embedded Svelte single-page application.
+- `GET /healthz`, `GET /api/health`, `GET /api/version`, `GET /api/status`
+- `GET /api/repositories`, `GET /api/stats?repo=<owner/name>`
+- `POST /api/sync` (`repository`, `limit`, `since`, `full`)
+- `POST /api/analyze` (`repository`, `item_number`, `limit`, `reanalyze`, `finder`)
+- `GET /api/items?repo=<owner/name>&kind=<kind>&state=<state>&dirty=<bool>&limit=<n>`
+- `GET /api/items/{number}?repo=<owner/name>`
+- `GET /api/threads?repo=<owner/name>&status=<active|resolved|stale>`
+- `GET /api/threads/show?id=<thread-id>`, `GET /api/threads/{id}`
+- `GET /api/relationships?repo=<owner/name>&type=<type>&verified=<bool>&thread=<id>&item=<n>`
+- `GET /api/relationships/show?id=<rel-id>`, `GET /api/relationships/{id}`
+- `POST /api/relationships/verify` (`id`, `verified`), `POST /api/relationships/{id}/verify`
 
 ## Core Concepts
 

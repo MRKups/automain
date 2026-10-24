@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,8 @@ import (
 	"github.com/MRKups/automain/internal/app"
 	"github.com/MRKups/automain/internal/config"
 	"github.com/MRKups/automain/internal/domain"
+	"github.com/MRKups/automain/internal/server"
+	"github.com/MRKups/automain/web"
 )
 
 // ServiceFactory builds the application Service once configuration and flags are resolved.
@@ -95,7 +98,7 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 	case "stats":
 		return runStats(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "serve":
-		return runServe(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+		return runServe(ctx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	default:
 		return writeError(stdout, stderr, jsonRequested, subcmd, domain.NewError(
 			domain.ErrorCodeInvalidInput,
@@ -617,9 +620,9 @@ func runStats(ctx context.Context, factory ServiceFactory, cfg config.Config, ar
 	return 0
 }
 
-func runServe(ctx context.Context, _ ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
+func runServe(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
 	if helpRequested {
-		fmt.Fprintln(stdout, "Usage: automain serve [--listen <host:port>] [--db <path>] [--json]")
+		fmt.Fprintln(stdout, "Usage: automain serve [--listen <host:port>] [--db <path>] [--repo <owner/name>] [--json]")
 		return 0
 	}
 	if err := ctx.Err(); err != nil {
@@ -643,13 +646,34 @@ func runServe(ctx context.Context, _ ServiceFactory, cfg config.Config, args []s
 			nil,
 		))
 	}
-	return writeError(stdout, stderr, jsonMode, "serve", domain.NewError(
-		domain.ErrorCodeNotConfigured,
-		"serve",
-		"HTTP API server adapter is not wired yet.",
-		"Run CLI commands directly or complete WO5 to enable 'automain serve'.",
-		nil,
-	))
+
+	svc, cleanup, err := factory(ctx, cfg)
+	if err != nil {
+		return writeError(stdout, stderr, jsonMode, "serve", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+
+	onListen := func(addr net.Addr) {
+		boundAddr := addr.String()
+		if jsonMode {
+			_ = writeJSONSuccess(stdout, "serve", map[string]any{
+				"listen_addr": boundAddr,
+				"url":         "http://" + boundAddr,
+				"db_path":     cfg.DBPath,
+				"repository":  cfg.Repository,
+				"ui_embedded": web.HasIndex(),
+			})
+			return
+		}
+		fmt.Fprintf(stdout, "Listening on http://%s (db: %s, ui_embedded: %t)\n", boundAddr, cfg.DBPath, web.HasIndex())
+	}
+
+	if err := server.ListenAndServe(ctx, cfg.ListenAddr, svc, cfg.Timeout, onListen); err != nil {
+		return writeError(stdout, stderr, jsonMode, "serve", err)
+	}
+	return 0
 }
 
 func validateCLIRequiredRepo(operation, repo string) error {

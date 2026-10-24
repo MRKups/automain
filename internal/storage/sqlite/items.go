@@ -353,13 +353,17 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 		return domain.SyncResult{}, fmt.Errorf("count dirty items for %q: %w", repo, err)
 	}
 
+	syncedAt = syncedAt.UTC().Truncate(time.Second)
 	syncedAtStr := formatTime(syncedAt)
 	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO repositories (repo, last_synced_at, cursor, sync_status, updated_at)
 		 VALUES (?, ?, '', 'synced', ?)
 		 ON CONFLICT (repo) DO UPDATE SET
-		     last_synced_at = excluded.last_synced_at,
+		     last_synced_at = CASE
+		         WHEN COALESCE(repositories.last_synced_at, '') > excluded.last_synced_at THEN repositories.last_synced_at
+		         ELSE excluded.last_synced_at
+		     END,
 		     sync_status = excluded.sync_status,
 		     updated_at = excluded.updated_at`,
 		repo,
@@ -430,12 +434,50 @@ func (s *Store) GetItem(ctx context.Context, repo string, number int) (domain.It
 
 // GetItemWithComments fetches an item together with all stored comments ordered chronologically.
 func (s *Store) GetItemWithComments(ctx context.Context, repo string, number int) (domain.Item, []domain.Comment, error) {
-	item, err := s.GetItem(ctx, repo, number)
-	if err != nil {
-		return domain.Item{}, nil, err
+	if err := ctx.Err(); err != nil {
+		return domain.Item{}, nil, domain.AsError("items.show", err)
+	}
+	if err := domain.ValidateRepoSlug(repo); err != nil {
+		return domain.Item{}, nil, domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"items.show",
+			err.Error(),
+			"Pass the repository in owner/name format.",
+			err,
+		)
+	}
+	if number <= 0 {
+		return domain.Item{}, nil, domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"items.show",
+			fmt.Sprintf("Item number must be a positive integer, got %d.", number),
+			"Pass a positive GitHub item number.",
+			nil,
+		)
 	}
 
-	rows, err := s.db.QueryContext(
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return domain.Item{}, nil, fmt.Errorf("begin read transaction for %s#%d: %w", repo, number, err)
+	}
+	defer rollbackTx(tx)
+
+	query := "SELECT " + itemSelectColumns + " FROM items WHERE repo = ? AND number = ?"
+	item, err := scanItem(tx.QueryRowContext(ctx, query, repo, number))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Item{}, nil, domain.NewError(
+			domain.ErrorCodeNotFound,
+			"items.show",
+			fmt.Sprintf("Item %s#%d was not found.", repo, number),
+			fmt.Sprintf("Run 'automain sync --repo %s' to import repository items.", repo),
+			err,
+		)
+	}
+	if err != nil {
+		return domain.Item{}, nil, fmt.Errorf("query item %s#%d: %w", repo, number, err)
+	}
+
+	rows, err := tx.QueryContext(
 		ctx,
 		`SELECT
 			repo,
@@ -552,8 +594,10 @@ func (s *Store) ListItems(ctx context.Context, filter domain.ItemFilter) ([]doma
 		query.WriteString(" AND state = ?")
 		args = append(args, string(filter.State))
 	}
-	if filter.DirtyOnly {
+	if filter.DirtyOnly || (filter.Dirty != nil && *filter.Dirty) {
 		query.WriteString(" AND (last_analyzed_hash IS NULL OR last_analyzed_hash = '' OR content_hash != last_analyzed_hash)")
+	} else if filter.Dirty != nil && !*filter.Dirty {
+		query.WriteString(" AND (last_analyzed_hash IS NOT NULL AND last_analyzed_hash != '' AND content_hash = last_analyzed_hash)")
 	}
 	query.WriteString(" ORDER BY number ASC")
 	if filter.Limit > 0 {
@@ -589,6 +633,61 @@ func (s *Store) ListDirtyItems(ctx context.Context, repo string, limit int) ([]d
 		DirtyOnly:  true,
 		Limit:      limit,
 	})
+}
+
+// ListRepositories returns sync watermarks and item/comment counts for all repositories present in SQLite.
+func (s *Store) ListRepositories(ctx context.Context) ([]domain.SyncWatermark, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, domain.AsError("repositories.list", err)
+	}
+
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT
+			r.repo,
+			COALESCE(r.last_synced_at, ''),
+			COALESCE(r.cursor, ''),
+			(SELECT COUNT(*) FROM items i WHERE i.repo = r.repo) AS item_count,
+			(SELECT COUNT(*) FROM comments c WHERE c.repo = r.repo) AS comment_count
+		FROM (
+			SELECT repo, last_synced_at, cursor FROM repositories
+			UNION
+			SELECT DISTINCT repo, '' AS last_synced_at, '' AS cursor FROM items
+			WHERE repo NOT IN (SELECT repo FROM repositories)
+			UNION
+			SELECT DISTINCT repo, '' AS last_synced_at, '' AS cursor FROM threads
+			WHERE repo NOT IN (SELECT repo FROM repositories)
+			  AND repo NOT IN (SELECT DISTINCT repo FROM items)
+		) r
+		ORDER BY COALESCE(r.last_synced_at, '') DESC, r.repo ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list repositories: %w", err)
+	}
+	defer closeRows(rows)
+
+	out := []domain.SyncWatermark{}
+	for rows.Next() {
+		var (
+			wm            domain.SyncWatermark
+			lastSyncedRaw string
+		)
+		if err := rows.Scan(&wm.Repository, &lastSyncedRaw, &wm.Cursor, &wm.ItemCount, &wm.CommentCount); err != nil {
+			return nil, fmt.Errorf("scan repository watermark: %w", err)
+		}
+		if strings.TrimSpace(lastSyncedRaw) != "" {
+			parsed, parseErr := parseTime(lastSyncedRaw)
+			if parseErr != nil {
+				return nil, fmt.Errorf("parse last_synced_at for %q: %w", wm.Repository, parseErr)
+			}
+			wm.LastSyncedAt = &parsed
+		}
+		out = append(out, wm)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate repositories: %w", err)
+	}
+	return out, nil
 }
 
 type rowScanner interface {

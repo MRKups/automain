@@ -11,6 +11,15 @@ tasks:
     cmds:
       - task --list
 
+  web:
+    desc: Build the Svelte frontend into web/dist
+    cmds:
+      - |
+        if [ ! -d web/node_modules ]; then
+          npm --prefix web install --no-package-lock
+        fi
+        npm --prefix web run build
+
   build:
     desc: Build the automain single binary into bin/automain
     cmds:

@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -94,6 +96,26 @@ func (c Config) Validate(operation string) error {
 			"Listen address (--listen or AUTOMAIN_LISTEN_ADDR) must not be empty.",
 			"Pass --listen 127.0.0.1:8080 or set AUTOMAIN_LISTEN_ADDR.",
 			nil,
+		)
+	}
+	_, portStr, err := net.SplitHostPort(strings.TrimSpace(c.ListenAddr))
+	if err != nil {
+		return domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			operation,
+			fmt.Sprintf("Invalid listen address %q: %v.", c.ListenAddr, err),
+			"Pass a host:port address such as --listen 127.0.0.1:8080.",
+			err,
+		)
+	}
+	portNum, portErr := strconv.Atoi(portStr)
+	if portErr != nil || portNum < 0 || portNum > 65535 {
+		return domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			operation,
+			fmt.Sprintf("Invalid listen port %q in %q; port must be an integer between 0 and 65535.", portStr, c.ListenAddr),
+			"Pass a valid TCP port such as --listen 127.0.0.1:8080.",
+			portErr,
 		)
 	}
 	if c.Timeout <= 0 {

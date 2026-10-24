@@ -41,6 +41,7 @@ type AnalyzeOptions struct {
 	ItemNumber int    `json:"item_number,omitempty"`
 	Limit      int    `json:"limit,omitempty"`
 	Reanalyze  bool   `json:"reanalyze,omitempty"`
+	Finder     string `json:"finder,omitempty"`
 }
 
 // AnalyzeResult summarizes threads created/updated and relationships persisted.
@@ -59,6 +60,7 @@ type ItemFilter struct {
 	Kind       ItemKind  `json:"kind,omitempty"`
 	State      ItemState `json:"state,omitempty"`
 	DirtyOnly  bool      `json:"dirty_only,omitempty"`
+	Dirty      *bool     `json:"dirty,omitempty"`
 	Limit      int       `json:"limit,omitempty"`
 }
 
@@ -125,6 +127,7 @@ type ItemAnalysisRecord struct {
 type Store interface {
 	SchemaVersion() int
 	GetSyncWatermark(ctx context.Context, repo string) (SyncWatermark, error)
+	ListRepositories(ctx context.Context) ([]SyncWatermark, error)
 	UpsertItemsBatch(ctx context.Context, repo string, batch FetchBatch, syncedAt time.Time) (SyncResult, error)
 	GetItem(ctx context.Context, repo string, number int) (Item, error)
 	GetItemWithComments(ctx context.Context, repo string, number int) (Item, []Comment, error)

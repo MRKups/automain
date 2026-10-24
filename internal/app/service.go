@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MRKups/automain/internal/analysis"
@@ -52,6 +53,7 @@ type StatusReport struct {
 
 // Service coordinates domain operations across the CLI and HTTP API surfaces.
 type Service struct {
+	mu       sync.Mutex
 	cfg      config.Config
 	adapters Adapters
 }
@@ -127,6 +129,9 @@ func (s *Service) Sync(ctx context.Context, opts domain.SyncOptions) (domain.Syn
 		)
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	opts.Repository = repo
 	var since *time.Time
 	if opts.Since != nil {
@@ -139,11 +144,11 @@ func (s *Service) Sync(ctx context.Context, opts domain.SyncOptions) (domain.Syn
 		since = wm.LastSyncedAt
 	}
 
-	syncedAt := time.Now().UTC().Truncate(time.Second)
 	batch, err := s.adapters.GitHub.FetchUpdates(ctx, opts, since)
 	if err != nil {
 		return domain.SyncResult{}, domain.AsError("sync", err)
 	}
+	syncedAt := time.Now().UTC().Truncate(time.Second)
 	res, err := s.adapters.Store.UpsertItemsBatch(ctx, repo, batch, syncedAt)
 	if err != nil {
 		return domain.SyncResult{}, domain.AsError("sync", err)
@@ -181,7 +186,22 @@ func (s *Service) Analyze(ctx context.Context, opts domain.AnalyzeOptions) (doma
 	if s.adapters.Store == nil {
 		return domain.AnalyzeResult{}, storageNotConfiguredError("analyze")
 	}
-	if s.adapters.Finder == nil || s.adapters.Analyser == nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	activeFinder := s.adapters.Finder
+	if overrideFinder := strings.ToLower(strings.TrimSpace(opts.Finder)); overrideFinder != "" {
+		llmClient, _ := s.adapters.Analyser.(*analysis.Client)
+		f, err := analysis.NewFinder(overrideFinder, llmClient)
+		if err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+		if overrideFinder != strings.ToLower(strings.TrimSpace(s.cfg.Finder)) || activeFinder == nil {
+			activeFinder = f
+		}
+	}
+
+	if activeFinder == nil || s.adapters.Analyser == nil {
 		return domain.AnalyzeResult{}, domain.NewError(
 			domain.ErrorCodeNotConfigured,
 			"analyze",
@@ -199,7 +219,7 @@ func (s *Service) Analyze(ctx context.Context, opts domain.AnalyzeOptions) (doma
 			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
 		}
 	}
-	if v, ok := s.adapters.Finder.(configValidator); ok {
+	if v, ok := activeFinder.(configValidator); ok {
 		if err := v.ValidateConfig(); err != nil {
 			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
 		}
@@ -275,7 +295,7 @@ func (s *Service) Analyze(ctx context.Context, opts domain.AnalyzeOptions) (doma
 		detailItemsByID := make(map[domain.ThreadID][]domain.Item)
 
 		if len(summaries) > 0 {
-			candidateIDs, err := s.adapters.Finder.FindCandidates(ctx, repo, item, summaries)
+			candidateIDs, err := activeFinder.FindCandidates(ctx, repo, item, summaries)
 			if err != nil {
 				return domain.AnalyzeResult{}, domain.AsError("analyze", err)
 			}
@@ -630,6 +650,8 @@ func (s *Service) VerifyRelationship(ctx context.Context, id domain.Relationship
 	if s.adapters.Store == nil {
 		return domain.Relationship{}, storageNotConfiguredError("relationships.verify")
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	rel, err := s.adapters.Store.VerifyRelationship(ctx, id, verified)
 	if err != nil {
 		return domain.Relationship{}, domain.AsError("relationships.verify", err)
@@ -654,6 +676,119 @@ func (s *Service) Stats(ctx context.Context, repoOverride string) (domain.RepoSt
 		return domain.RepoStats{}, domain.AsError("stats", err)
 	}
 	return stats, nil
+}
+
+// ListItems returns repository items matching filter.
+func (s *Service) ListItems(ctx context.Context, filter domain.ItemFilter) ([]domain.Item, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, domain.AsError("items.list", err)
+	}
+	repo := s.resolveRepo(filter.Repository)
+	if err := requireRepo("items.list", repo); err != nil {
+		return nil, err
+	}
+	if filter.Kind != "" {
+		if err := filter.Kind.Validate(); err != nil {
+			return nil, domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"items.list",
+				err.Error(),
+				"Use kind issue, pull_request, or discussion.",
+				err,
+			)
+		}
+	}
+	if filter.State != "" {
+		if err := filter.State.Validate(); err != nil {
+			return nil, domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"items.list",
+				err.Error(),
+				"Use state open, closed, merged, or answered.",
+				err,
+			)
+		}
+	}
+	if filter.Limit < 0 {
+		return nil, domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"items.list",
+			"Item limit must not be negative.",
+			"Pass a non-negative integer for limit.",
+			nil,
+		)
+	}
+	if s.adapters.Store == nil {
+		return nil, storageNotConfiguredError("items.list")
+	}
+	filter.Repository = repo
+	items, err := s.adapters.Store.ListItems(ctx, filter)
+	if err != nil {
+		return nil, domain.AsError("items.list", err)
+	}
+	return items, nil
+}
+
+// GetItem returns a repository item together with its chronologically ordered comments.
+func (s *Service) GetItem(ctx context.Context, repoOverride string, number int) (domain.Item, []domain.Comment, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.Item{}, nil, domain.AsError("items.show", err)
+	}
+	repo := s.resolveRepo(repoOverride)
+	if err := requireRepo("items.show", repo); err != nil {
+		return domain.Item{}, nil, err
+	}
+	if number <= 0 {
+		return domain.Item{}, nil, domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"items.show",
+			"Item number must be a positive integer.",
+			"Pass a positive GitHub item number.",
+			nil,
+		)
+	}
+	if s.adapters.Store == nil {
+		return domain.Item{}, nil, storageNotConfiguredError("items.show")
+	}
+	item, comments, err := s.adapters.Store.GetItemWithComments(ctx, repo, number)
+	if err != nil {
+		return domain.Item{}, nil, domain.AsError("items.show", err)
+	}
+	return item, comments, nil
+}
+
+// ListRepositories returns sync watermarks for repositories stored in SQLite.
+func (s *Service) ListRepositories(ctx context.Context) ([]domain.SyncWatermark, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, domain.AsError("repositories.list", err)
+	}
+	if s.adapters.Store == nil {
+		return nil, storageNotConfiguredError("repositories.list")
+	}
+	repos, err := s.adapters.Store.ListRepositories(ctx)
+	if err != nil {
+		return nil, domain.AsError("repositories.list", err)
+	}
+	cfgRepo := strings.TrimSpace(s.cfg.Repository)
+	if cfgRepo != "" && domain.ValidateRepoSlug(cfgRepo) == nil {
+		found := false
+		for _, r := range repos {
+			if r.Repository == cfgRepo {
+				found = true
+				break
+			}
+		}
+		if !found {
+			wm, wmErr := s.adapters.Store.GetSyncWatermark(ctx, cfgRepo)
+			if wmErr == nil {
+				repos = append(repos, wm)
+			}
+		}
+	}
+	if repos == nil {
+		repos = []domain.SyncWatermark{}
+	}
+	return repos, nil
 }
 
 func (s *Service) resolveRepo(override string) string {
