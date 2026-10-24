@@ -19,7 +19,7 @@ type ServiceFactory func(ctx context.Context, cfg config.Config) (*app.Service, 
 
 // Execute parses CLI arguments, runs the requested subcommand, and returns the process exit code.
 func Execute(ctx context.Context, args []string, baseCfg config.Config, factory ServiceFactory, stdout, stderr io.Writer) int {
-	jsonRequested := detectJSONFlag(args)
+	jsonRequested := baseCfg.JSONOutput || detectJSONFlag(args)
 
 	globalCfg, remaining, helpRequested, err := extractGlobalFlags(baseCfg, args)
 	if err != nil {
@@ -49,8 +49,10 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 		return 0
 	}
 
-	if err := globalCfg.Validate(subcmd); err != nil {
-		return writeError(stdout, stderr, jsonRequested, subcmd, err)
+	if !helpRequested {
+		if err := globalCfg.Validate(subcmd); err != nil {
+			return writeError(stdout, stderr, jsonRequested, subcmd, err)
+		}
 	}
 
 	cmdCtx, cancel := context.WithTimeout(ctx, globalCfg.Timeout)
@@ -156,7 +158,11 @@ func runSync(ctx context.Context, factory ServiceFactory, cfg config.Config, arg
 
 	var since *time.Time
 	if strings.TrimSpace(*sinceStr) != "" {
-		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(*sinceStr))
+		rawSince := strings.TrimSpace(*sinceStr)
+		parsed, err := time.Parse(time.RFC3339, rawSince)
+		if err != nil {
+			parsed, err = time.Parse(time.RFC3339Nano, rawSince)
+		}
 		if err != nil {
 			return writeError(stdout, stderr, jsonMode, "sync", domain.NewError(
 				domain.ErrorCodeInvalidInput,
@@ -166,7 +172,8 @@ func runSync(ctx context.Context, factory ServiceFactory, cfg config.Config, arg
 				err,
 			))
 		}
-		since = &parsed
+		utc := parsed.UTC()
+		since = &utc
 	}
 	if err := validateCLIRequiredRepo("sync", cfg.Repository); err != nil {
 		return writeError(stdout, stderr, jsonMode, "sync", err)
@@ -210,7 +217,7 @@ func runSync(ctx context.Context, factory ServiceFactory, cfg config.Config, arg
 
 func runAnalyze(ctx context.Context, factory ServiceFactory, cfg config.Config, args []string, jsonMode, helpRequested bool, stdout, stderr io.Writer) int {
 	if helpRequested {
-		fmt.Fprintln(stdout, "Usage: automain analyze --repo <owner/name> [--item <number>] [--limit <n>] [--reanalyze] [--json]")
+		fmt.Fprintln(stdout, "Usage: automain analyze --repo <owner/name> [--item <number>] [--limit <n>] [--reanalyze] [--finder llm|fts|vector] [--timeout <duration>] [--json]")
 		return 0
 	}
 	fs := newSubFlagSet("analyze")
@@ -223,7 +230,7 @@ func runAnalyze(ctx context.Context, factory ServiceFactory, cfg config.Config, 
 	if err := validateCLIRequiredRepo("analyze", cfg.Repository); err != nil {
 		return writeError(stdout, stderr, jsonMode, "analyze", err)
 	}
-	if *itemNum < 0 {
+	if *itemNum < 0 || (flagWasSet(fs, "item") && *itemNum <= 0) {
 		return writeError(stdout, stderr, jsonMode, "analyze", domain.NewError(
 			domain.ErrorCodeInvalidInput,
 			"analyze",
@@ -425,11 +432,11 @@ func runRelationships(ctx context.Context, factory ServiceFactory, cfg config.Co
 		if err := validateCLIRequiredRepo("relationships.list", cfg.Repository); err != nil {
 			return writeError(stdout, stderr, jsonMode, "relationships.list", err)
 		}
-		if *itemNum < 0 {
+		if *itemNum < 0 || (flagWasSet(fs, "item") && *itemNum <= 0) {
 			return writeError(stdout, stderr, jsonMode, "relationships.list", domain.NewError(
 				domain.ErrorCodeInvalidInput,
 				"relationships.list",
-				"Item number (--item) must not be negative.",
+				"Item number (--item) must be a positive integer.",
 				"Pass a positive GitHub item number via --item <number>.",
 				nil,
 			))
@@ -927,6 +934,16 @@ func consumeValue(flagName string, args []string, idx int) (string, int, error) 
 		)
 	}
 	return val, idx + 1, nil
+}
+
+func flagWasSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
 }
 
 func writeMainUsage(w io.Writer) {

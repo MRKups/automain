@@ -90,6 +90,52 @@ func upsertRelationshipTx(ctx context.Context, tx *sql.Tx, rel domain.Relationsh
 		)
 	}
 
+	var itemExists int
+	if err := tx.QueryRowContext(
+		ctx,
+		"SELECT 1 FROM items WHERE repo = ? AND number = ?",
+		rel.Repository,
+		rel.ItemNumber,
+	).Scan(&itemExists); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.NewError(
+				domain.ErrorCodeNotFound,
+				"relationships.upsert",
+				fmt.Sprintf("Item %s#%d for relationship %q was not found.", rel.Repository, rel.ItemNumber, rel.ID),
+				fmt.Sprintf("Run 'automain sync --repo %s' before linking relationships to item #%d.", rel.Repository, rel.ItemNumber),
+				err,
+			)
+		}
+		return fmt.Errorf("lookup item %s#%d for relationship %q: %w", rel.Repository, rel.ItemNumber, rel.ID, err)
+	}
+
+	var (
+		existingRepo   string
+		existingThread string
+		existingItem   int
+		existingType   string
+	)
+	if qErr := tx.QueryRowContext(
+		ctx,
+		"SELECT repo, thread_id, item_number, rel_type FROM relationships WHERE id = ?",
+		string(rel.ID),
+	).Scan(&existingRepo, &existingThread, &existingItem, &existingType); qErr == nil {
+		if existingRepo != rel.Repository ||
+			existingThread != string(rel.ThreadID) ||
+			existingItem != rel.ItemNumber ||
+			existingType != string(rel.Type) {
+			return domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"relationships.upsert",
+				fmt.Sprintf("Relationship ID %q is already assigned to %s#%d (%s on thread %q).", rel.ID, existingRepo, existingItem, existingType, existingThread),
+				"Use a unique relationship ID for each distinct (repo, thread_id, item_number, type) tuple.",
+				nil,
+			)
+		}
+	} else if !errors.Is(qErr, sql.ErrNoRows) {
+		return fmt.Errorf("check existing relationship %q: %w", rel.ID, qErr)
+	}
+
 	if _, err := tx.ExecContext(
 		ctx,
 		`INSERT INTO relationships (

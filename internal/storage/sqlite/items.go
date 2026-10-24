@@ -132,6 +132,7 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 			)
 		}
 		seenItems[item.Number] = struct{}{}
+		item.Labels = domain.NormalizeLabels(item.Labels)
 		item.LastAnalyzedHash = ""
 		normalizedItems[i] = item
 	}
@@ -276,6 +277,46 @@ func (s *Store) UpsertItemsBatch(ctx context.Context, repo string, batch domain.
 	}
 
 	for _, c := range normalizedComments {
+		if _, inBatch := seenItems[c.ItemNumber]; !inBatch {
+			var exists int
+			qErr := tx.QueryRowContext(
+				ctx,
+				"SELECT 1 FROM items WHERE repo = ? AND number = ?",
+				repo,
+				c.ItemNumber,
+			).Scan(&exists)
+			if errors.Is(qErr, sql.ErrNoRows) {
+				return domain.SyncResult{}, domain.NewError(
+					domain.ErrorCodeNotFound,
+					"storage.upsert_batch",
+					fmt.Sprintf("Parent item %s#%d for comment %q was not found.", repo, c.ItemNumber, c.CommentID),
+					"Include the parent item in the sync batch before upserting its comments.",
+					qErr,
+				)
+			}
+			if qErr != nil {
+				return domain.SyncResult{}, fmt.Errorf("lookup parent item %s#%d for comment %q: %w", repo, c.ItemNumber, c.CommentID, qErr)
+			}
+		}
+		var existingCommentItem int
+		cErr := tx.QueryRowContext(
+			ctx,
+			"SELECT item_number FROM comments WHERE repo = ? AND comment_id = ?",
+			repo,
+			c.CommentID,
+		).Scan(&existingCommentItem)
+		if cErr != nil && !errors.Is(cErr, sql.ErrNoRows) {
+			return domain.SyncResult{}, fmt.Errorf("lookup existing comment %q in %q: %w", c.CommentID, repo, cErr)
+		}
+		if cErr == nil && existingCommentItem != c.ItemNumber {
+			return domain.SyncResult{}, domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"storage.upsert_batch",
+				fmt.Sprintf("Comment %q in %q already belongs to item #%d, not #%d.", c.CommentID, repo, existingCommentItem, c.ItemNumber),
+				"Ensure comment IDs are unique across repository items.",
+				nil,
+			)
+		}
 		if _, err := tx.ExecContext(
 			ctx,
 			`INSERT INTO comments (

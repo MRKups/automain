@@ -48,6 +48,19 @@ func (s *Store) CreateThread(ctx context.Context, thread domain.Thread) error {
 		thread.UpdatedAt = thread.CreatedAt
 	}
 
+	var existing int
+	if qErr := s.db.QueryRowContext(ctx, "SELECT 1 FROM threads WHERE id = ?", string(thread.ID)).Scan(&existing); qErr == nil {
+		return domain.NewError(
+			domain.ErrorCodeInvalidInput,
+			"threads.create",
+			fmt.Sprintf("Thread %q already exists.", thread.ID),
+			"Use a unique thread ID or call UpdateThread to modify an existing thread.",
+			nil,
+		)
+	} else if !errors.Is(qErr, sql.ErrNoRows) {
+		return fmt.Errorf("check existing thread %q: %w", thread.ID, qErr)
+	}
+
 	if _, err := s.db.ExecContext(
 		ctx,
 		`INSERT INTO threads (id, repo, title, summary, status, revision, created_at, updated_at)
@@ -473,6 +486,18 @@ func (s *Store) SaveItemAnalysis(ctx context.Context, record domain.ItemAnalysis
 	}
 
 	for _, t := range record.ThreadsToCreate {
+		var existing int
+		if qErr := tx.QueryRowContext(ctx, "SELECT 1 FROM threads WHERE id = ?", string(t.ID)).Scan(&existing); qErr == nil {
+			return domain.NewError(
+				domain.ErrorCodeInvalidInput,
+				"storage.save_analysis",
+				fmt.Sprintf("Thread %q to create already exists.", t.ID),
+				"Use ThreadsToUpdate to modify existing threads or provide a unique ID for new threads.",
+				nil,
+			)
+		} else if !errors.Is(qErr, sql.ErrNoRows) {
+			return fmt.Errorf("check existing thread %q during analysis save: %w", t.ID, qErr)
+		}
 		if _, err := tx.ExecContext(
 			ctx,
 			`INSERT INTO threads (id, repo, title, summary, status, revision, created_at, updated_at)
@@ -540,9 +565,65 @@ func (s *Store) SaveItemAnalysis(ctx context.Context, record domain.ItemAnalysis
 		}
 	}
 
+	type priorRel struct {
+		id       string
+		threadID string
+		relType  string
+		verified bool
+	}
+	var priorRels []priorRel
+	verifiedByThread := make(map[string]bool)
+	priorRows, err := tx.QueryContext(
+		ctx,
+		"SELECT id, thread_id, rel_type, verified_by_human FROM relationships WHERE repo = ? AND item_number = ?",
+		record.Repository,
+		record.ItemNumber,
+	)
+	if err != nil {
+		return fmt.Errorf("query existing relationships for %s#%d: %w", record.Repository, record.ItemNumber, err)
+	}
+	for priorRows.Next() {
+		var pr priorRel
+		var verInt int
+		if err := priorRows.Scan(&pr.id, &pr.threadID, &pr.relType, &verInt); err != nil {
+			closeRows(priorRows)
+			return fmt.Errorf("scan existing relationship for %s#%d: %w", record.Repository, record.ItemNumber, err)
+		}
+		pr.verified = verInt != 0
+		if pr.verified {
+			verifiedByThread[pr.threadID] = true
+		}
+		priorRels = append(priorRels, pr)
+	}
+	if err := priorRows.Err(); err != nil {
+		closeRows(priorRows)
+		return fmt.Errorf("iterate existing relationships for %s#%d: %w", record.Repository, record.ItemNumber, err)
+	}
+	closeRows(priorRows)
+
+	keepTuples := make(map[string]struct{}, len(record.Relationships))
+	keepThreads := make(map[string]struct{}, len(record.Relationships))
 	for _, rel := range record.Relationships {
+		if verifiedByThread[string(rel.ThreadID)] {
+			rel.VerifiedByHuman = true
+		}
 		if err := upsertRelationshipTx(ctx, tx, rel); err != nil {
 			return err
+		}
+		keepTuples[string(rel.ThreadID)+"\x00"+string(rel.Type)] = struct{}{}
+		keepThreads[string(rel.ThreadID)] = struct{}{}
+	}
+
+	for _, pr := range priorRels {
+		tupleKey := pr.threadID + "\x00" + pr.relType
+		if _, kept := keepTuples[tupleKey]; kept {
+			continue
+		}
+		_, threadStillLinked := keepThreads[pr.threadID]
+		if !pr.verified || threadStillLinked {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM relationships WHERE id = ?", pr.id); err != nil {
+				return fmt.Errorf("delete superseded relationship %q for %s#%d: %w", pr.id, record.Repository, record.ItemNumber, err)
+			}
 		}
 	}
 

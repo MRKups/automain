@@ -7,11 +7,12 @@ persistent threads backed by source evidence.
 ## Status
 
 Core domain contracts (`internal/domain`), runtime configuration
-(`internal/config`), SQLite persistence (`internal/storage/sqlite`), application
-service facade (`internal/app`), embedded web asset boundary (`web`), and the
-`automain` CLI (`cmd/automain`, `internal/cli`) for `status`, `version`,
-`threads`, `relationships`, and `stats` are implemented. GitHub ingestion
-(`sync`), relationship analysis (`analyze`), HTTP endpoints (`serve`), and the
+(`internal/config`), SQLite persistence (`internal/storage/sqlite`), GitHub
+ingestion (`internal/github`), candidate discovery and relationship analysis
+(`internal/analysis`), application service facade (`internal/app`), embedded
+web asset boundary (`web`), and the `automain` CLI (`cmd/automain`,
+`internal/cli`) for `status`, `version`, `sync`, `analyze`, `threads`,
+`relationships`, and `stats` are implemented. HTTP endpoints (`serve`) and the
 Svelte UI are not wired yet.
 
 ## Stack
@@ -41,7 +42,7 @@ task sandbox -- status --json
 automain status [--db <path>] [--repo <owner/name>] [--json]
 automain version [--json]
 automain sync --repo <owner/name> [--limit <n>] [--since <RFC3339>] [--full] [--json]
-automain analyze --repo <owner/name> [--item <number>] [--limit <n>] [--reanalyze] [--json]
+automain analyze --repo <owner/name> [--item <number>] [--limit <n>] [--reanalyze] [--finder llm|fts|vector] [--json]
 automain threads [list|show] [--repo <owner/name>] [--id <thread-id>] [--json]
 automain relationships [list|show|verify] [--repo <owner/name>] [--id <rel-id>] [--json]
 automain stats --repo <owner/name> [--json]

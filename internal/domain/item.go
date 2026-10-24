@@ -1,7 +1,11 @@
 package domain
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -123,4 +127,118 @@ type SyncWatermark struct {
 	Cursor       string     `json:"cursor,omitempty"`
 	ItemCount    int        `json:"item_count"`
 	CommentCount int        `json:"comment_count"`
+}
+
+type canonicalCommentHash struct {
+	CommentID string `json:"comment_id"`
+	Author    string `json:"author"`
+	Body      string `json:"body"`
+}
+
+type canonicalItemHash struct {
+	Kind     ItemKind               `json:"kind"`
+	State    ItemState              `json:"state"`
+	Title    string                 `json:"title"`
+	Body     string                 `json:"body"`
+	Author   string                 `json:"author"`
+	Labels   []string               `json:"labels"`
+	Comments []canonicalCommentHash `json:"comments"`
+}
+
+// NormalizeLabels returns a deduplicated, sorted slice of non-empty label names.
+func NormalizeLabels(labels []string) []string {
+	if len(labels) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(labels))
+	out := make([]string, 0, len(labels))
+	for _, raw := range labels {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ComputeItemContentHash computes a deterministic SHA-256 hex digest over an item's
+// normalized fields and its associated comments.
+func ComputeItemContentHash(item Item, comments []Comment) string {
+	itemRepo := strings.TrimSpace(item.Repository)
+	byID := make(map[string]Comment, len(comments))
+	order := make([]string, 0, len(comments))
+
+	for _, c := range comments {
+		cid := strings.TrimSpace(c.CommentID)
+		if cid == "" {
+			continue
+		}
+		cRepo := strings.TrimSpace(c.Repository)
+		if itemRepo != "" && cRepo != "" && cRepo != itemRepo {
+			continue
+		}
+		if c.ItemNumber != 0 && item.Number != 0 && c.ItemNumber != item.Number {
+			continue
+		}
+		if _, exists := byID[cid]; !exists {
+			order = append(order, cid)
+		}
+		c.CommentID = cid
+		byID[cid] = c
+	}
+
+	filtered := make([]Comment, 0, len(order))
+	for _, cid := range order {
+		filtered = append(filtered, byID[cid])
+	}
+
+	sort.SliceStable(filtered, func(i, j int) bool {
+		ti := filtered[i].CreatedAt.UTC()
+		tj := filtered[j].CreatedAt.UTC()
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		if filtered[i].CommentID != filtered[j].CommentID {
+			return filtered[i].CommentID < filtered[j].CommentID
+		}
+		ai := strings.TrimSpace(filtered[i].Author)
+		aj := strings.TrimSpace(filtered[j].Author)
+		if ai != aj {
+			return ai < aj
+		}
+		return filtered[i].Body < filtered[j].Body
+	})
+
+	canonComments := make([]canonicalCommentHash, len(filtered))
+	for i, c := range filtered {
+		canonComments[i] = canonicalCommentHash{
+			CommentID: c.CommentID,
+			Author:    strings.TrimSpace(c.Author),
+			Body:      c.Body,
+		}
+	}
+
+	payload := canonicalItemHash{
+		Kind:     item.Kind,
+		State:    item.State,
+		Title:    strings.TrimSpace(item.Title),
+		Body:     item.Body,
+		Author:   strings.TrimSpace(item.Author),
+		Labels:   NormalizeLabels(item.Labels),
+		Comments: canonComments,
+	}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%s", item.Kind, item.State, item.Title, item.Body)))
+		return hex.EncodeToString(sum[:])
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }

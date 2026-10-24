@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MRKups/automain/internal/analysis"
 	"github.com/MRKups/automain/internal/config"
 	"github.com/MRKups/automain/internal/domain"
 )
@@ -138,11 +139,12 @@ func (s *Service) Sync(ctx context.Context, opts domain.SyncOptions) (domain.Syn
 		since = wm.LastSyncedAt
 	}
 
+	syncedAt := time.Now().UTC().Truncate(time.Second)
 	batch, err := s.adapters.GitHub.FetchUpdates(ctx, opts, since)
 	if err != nil {
 		return domain.SyncResult{}, domain.AsError("sync", err)
 	}
-	res, err := s.adapters.Store.UpsertItemsBatch(ctx, repo, batch, time.Now().UTC())
+	res, err := s.adapters.Store.UpsertItemsBatch(ctx, repo, batch, syncedAt)
 	if err != nil {
 		return domain.SyncResult{}, domain.AsError("sync", err)
 	}
@@ -188,13 +190,308 @@ func (s *Service) Analyze(ctx context.Context, opts domain.AnalyzeOptions) (doma
 			nil,
 		)
 	}
-	return domain.AnalyzeResult{}, domain.NewError(
-		domain.ErrorCodeNotConfigured,
-		"analyze",
-		"Thread analysis pipeline is not wired yet.",
-		"Complete WO4 to enable candidate discovery and relationship analysis.",
-		nil,
-	)
+
+	type configValidator interface {
+		ValidateConfig() error
+	}
+	if v, ok := s.adapters.Analyser.(configValidator); ok {
+		if err := v.ValidateConfig(); err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+	}
+	if v, ok := s.adapters.Finder.(configValidator); ok {
+		if err := v.ValidateConfig(); err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+	}
+
+	var targetItems []domain.Item
+	if opts.ItemNumber > 0 {
+		item, err := s.adapters.Store.GetItem(ctx, repo, opts.ItemNumber)
+		if err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+		if opts.Reanalyze || item.IsDirty() {
+			targetItems = []domain.Item{item}
+		}
+	} else if opts.Reanalyze {
+		items, err := s.adapters.Store.ListItems(ctx, domain.ItemFilter{
+			Repository: repo,
+			DirtyOnly:  false,
+			Limit:      opts.Limit,
+		})
+		if err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+		targetItems = items
+	} else {
+		items, err := s.adapters.Store.ListDirtyItems(ctx, repo, opts.Limit)
+		if err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+		targetItems = items
+	}
+
+	result := domain.AnalyzeResult{
+		Repository: repo,
+	}
+
+	for _, target := range targetItems {
+		if err := ctx.Err(); err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+
+		item, comments, err := s.adapters.Store.GetItemWithComments(ctx, repo, target.Number)
+		if err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+
+		existingThreads, err := s.adapters.Store.ListThreads(ctx, domain.ThreadFilter{
+			Repository: repo,
+		})
+		if err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+
+		summaries := make([]domain.ThreadSummary, 0, len(existingThreads))
+		existingByID := make(map[domain.ThreadID]domain.Thread, len(existingThreads))
+		existingByNormTitle := make(map[string]domain.Thread, len(existingThreads))
+		for _, t := range existingThreads {
+			summaries = append(summaries, domain.ThreadSummary{
+				ID:        t.ID,
+				Title:     t.Title,
+				Summary:   t.Summary,
+				Status:    t.Status,
+				ItemCount: t.ItemCount,
+			})
+			existingByID[t.ID] = t
+			normTitle := strings.ToLower(strings.Join(strings.Fields(t.Title), " "))
+			if normTitle != "" {
+				existingByNormTitle[normTitle] = t
+			}
+		}
+
+		var candidates []domain.CandidateThread
+		detailItemsByID := make(map[domain.ThreadID][]domain.Item)
+
+		if len(summaries) > 0 {
+			candidateIDs, err := s.adapters.Finder.FindCandidates(ctx, repo, item, summaries)
+			if err != nil {
+				return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+			}
+			seenCand := make(map[domain.ThreadID]struct{}, len(candidateIDs))
+			for _, rawID := range candidateIDs {
+				cid := domain.ThreadID(strings.TrimSpace(string(rawID)))
+				if cid == "" {
+					continue
+				}
+				if _, dup := seenCand[cid]; dup {
+					continue
+				}
+				if _, exists := existingByID[cid]; !exists {
+					continue
+				}
+				seenCand[cid] = struct{}{}
+				detail, err := s.adapters.Store.GetThreadDetail(ctx, cid)
+				if err != nil {
+					return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+				}
+				candidates = append(candidates, domain.CandidateThread{
+					Thread: detail.Thread,
+					Items:  detail.Items,
+				})
+				detailItemsByID[cid] = detail.Items
+			}
+		}
+
+		rawDecision, err := s.adapters.Analyser.Analyse(ctx, item, comments, candidates)
+		if err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+
+		decision, err := analysis.NormalizeDecision(item, comments, candidates, rawDecision)
+		if err != nil {
+			return domain.AnalyzeResult{}, domain.NewError(
+				domain.ErrorCodeExternalUnavailable,
+				"analyze",
+				err.Error(),
+				"Ensure relationship analysis output contains valid thread IDs, relationship types, confidence levels, and evidence.",
+				err,
+			)
+		}
+
+		record, err := s.buildItemAnalysisRecord(ctx, repo, item, comments, existingByID, existingByNormTitle, detailItemsByID, decision)
+		if err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+
+		if err := s.adapters.Store.SaveItemAnalysis(ctx, record); err != nil {
+			return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		}
+
+		result.AnalyzedItems++
+		result.ThreadsCreated += len(record.ThreadsToCreate)
+		result.ThreadsUpdated += len(record.ThreadsToUpdate)
+		result.RelationshipsUpserted += len(record.Relationships)
+	}
+
+	remainingDirty, err := s.adapters.Store.ListDirtyItems(ctx, repo, 0)
+	if err != nil {
+		return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+	}
+	result.RemainingDirtyItems = len(remainingDirty)
+
+	return result, nil
+}
+
+func (s *Service) buildItemAnalysisRecord(
+	ctx context.Context,
+	repo string,
+	item domain.Item,
+	comments []domain.Comment,
+	existingByID map[domain.ThreadID]domain.Thread,
+	existingByNormTitle map[string]domain.Thread,
+	detailItemsByID map[domain.ThreadID][]domain.Item,
+	decision domain.AnalysisDecision,
+) (domain.ItemAnalysisRecord, error) {
+	now := time.Now().UTC().Truncate(time.Second)
+	record := domain.ItemAnalysisRecord{
+		Repository:   repo,
+		ItemNumber:   item.Number,
+		AnalyzedHash: item.ContentHash,
+	}
+
+	updatedIdxByID := make(map[domain.ThreadID]int)
+	createdIdxByID := make(map[domain.ThreadID]int)
+	seenRelThread := make(map[domain.ThreadID]struct{})
+
+	addRelationship := func(threadID domain.ThreadID, relType domain.RelationshipType, conf domain.ConfidenceLevel, explanation string, evidence []domain.EvidenceRef, memberItems []domain.Item) {
+		if _, exists := seenRelThread[threadID]; exists {
+			return
+		}
+		seenRelThread[threadID] = struct{}{}
+
+		explicit := analysis.DetectExplicitLink(repo, item, comments, memberItems, evidence)
+		rel := domain.Relationship{
+			ID:               analysis.DeterministicRelationshipID(repo, threadID, item.Number, relType),
+			Repository:       repo,
+			ThreadID:         threadID,
+			ItemNumber:       item.Number,
+			Type:             relType,
+			Explanation:      explanation,
+			Confidence:       conf,
+			Evidence:         evidence,
+			ExplicitlyLinked: explicit,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}
+		record.Relationships = append(record.Relationships, rel)
+	}
+
+	for _, m := range decision.MatchedThreads {
+		existing, ok := existingByID[m.ThreadID]
+		if !ok {
+			detail, err := s.adapters.Store.GetThreadDetail(ctx, m.ThreadID)
+			if err != nil {
+				return domain.ItemAnalysisRecord{}, err
+			}
+			existing = detail.Thread
+			existingByID[m.ThreadID] = existing
+			normTitle := strings.ToLower(strings.Join(strings.Fields(existing.Title), " "))
+			if normTitle != "" {
+				existingByNormTitle[normTitle] = existing
+			}
+			detailItemsByID[m.ThreadID] = detail.Items
+		}
+
+		memberItems, hasItems := detailItemsByID[existing.ID]
+		if !hasItems {
+			if detail, err := s.adapters.Store.GetThreadDetail(ctx, existing.ID); err == nil {
+				memberItems = detail.Items
+				detailItemsByID[existing.ID] = memberItems
+			}
+		}
+
+		if idx, alreadyUpdated := updatedIdxByID[existing.ID]; alreadyUpdated {
+			if strings.TrimSpace(m.UpdatedThreadSummary) != "" {
+				record.ThreadsToUpdate[idx].Summary = m.UpdatedThreadSummary
+			}
+			if m.UpdatedThreadStatus != "" {
+				record.ThreadsToUpdate[idx].Status = m.UpdatedThreadStatus
+			}
+		} else {
+			updatedIdxByID[existing.ID] = len(record.ThreadsToUpdate)
+			record.ThreadsToUpdate = append(record.ThreadsToUpdate, domain.Thread{
+				ID:         existing.ID,
+				Repository: repo,
+				Title:      existing.Title,
+				Summary:    m.UpdatedThreadSummary,
+				Status:     m.UpdatedThreadStatus,
+				Revision:   existing.Revision + 1,
+				CreatedAt:  existing.CreatedAt,
+				UpdatedAt:  now,
+			})
+		}
+
+		addRelationship(existing.ID, m.RelationshipType, m.Confidence, m.Explanation, m.Evidence, memberItems)
+	}
+
+	for _, n := range decision.NewThreads {
+		normTitle := strings.ToLower(strings.Join(strings.Fields(n.Title), " "))
+		tid := analysis.DeterministicThreadID(repo, n.Title)
+
+		existing, existsInStore := existingByID[tid]
+		if !existsInStore && normTitle != "" {
+			if byTitle, ok := existingByNormTitle[normTitle]; ok {
+				existing = byTitle
+				tid = existing.ID
+				existsInStore = true
+			}
+		}
+
+		if existsInStore {
+			memberItems, hasItems := detailItemsByID[existing.ID]
+			if !hasItems {
+				if detail, err := s.adapters.Store.GetThreadDetail(ctx, existing.ID); err == nil {
+					memberItems = detail.Items
+					detailItemsByID[existing.ID] = memberItems
+				}
+			}
+			if _, alreadyUpdated := updatedIdxByID[existing.ID]; !alreadyUpdated {
+				updatedIdxByID[existing.ID] = len(record.ThreadsToUpdate)
+				record.ThreadsToUpdate = append(record.ThreadsToUpdate, domain.Thread{
+					ID:         existing.ID,
+					Repository: repo,
+					Title:      existing.Title,
+					Summary:    n.Summary,
+					Status:     n.Status,
+					Revision:   existing.Revision + 1,
+					CreatedAt:  existing.CreatedAt,
+					UpdatedAt:  now,
+				})
+			}
+			addRelationship(existing.ID, n.RelationshipType, n.Confidence, n.Explanation, n.Evidence, memberItems)
+			continue
+		}
+
+		if _, alreadyCreating := createdIdxByID[tid]; !alreadyCreating {
+			createdIdxByID[tid] = len(record.ThreadsToCreate)
+			record.ThreadsToCreate = append(record.ThreadsToCreate, domain.Thread{
+				ID:         tid,
+				Repository: repo,
+				Title:      n.Title,
+				Summary:    n.Summary,
+				Status:     n.Status,
+				Revision:   1,
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			})
+		}
+
+		addRelationship(tid, n.RelationshipType, n.Confidence, n.Explanation, n.Evidence, nil)
+	}
+
+	return record, nil
 }
 
 // ListThreads returns persistent threads matching filter.
