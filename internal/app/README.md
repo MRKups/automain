@@ -58,15 +58,13 @@ is usable through CLI/API; its automatic composition with retrieval is not chose
 
 ## Concurrency and partial progress
 
-A per-service mutex serializes sync, legacy analysis, index preparation/embedding,
-reconciliation/migration, and verification. It spans remote requests.
-Search, similarity, status/read operations, and standalone decisions do not take
-that mutation mutex.
-
-**Known defect (R4):** waiting for this mutex does not honor cancellation. A canceled
-prepare/embed/reconcile/migration request can remain queued until the current remote
-operation releases it. The operation context bounds downstream effects, not this
-wait. See the [review follow-up](../../QDRANT_IMPLEMENTATION_PLAN.md#review-follow-up).
+Sync, legacy analysis, index preparation/embedding, reconciliation/migration, and
+verification are serialized per service, including their remote requests. A queued
+operation can leave promptly on cancellation or deadline without starting downstream
+work. It returns `external_unavailable` with the cancellation cause preserved and
+requires an explicit retry. Cancellation is checked again when ownership is granted.
+Search, similarity, status/read operations, and standalone decisions do not wait
+for mutation ownership.
 
 This protects operations within one service instance, not independent CLI
 processes. Separate processes are not coordinated by job locks and may duplicate

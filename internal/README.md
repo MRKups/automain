@@ -2,7 +2,7 @@
 
 [Project overview](../README.md)
 
-[High-level architecture](../docs/architecture.md) owns product direction and
+Local `docs/architecture.md` owns product direction and
 accepted boundaries. This guide maps the current implementation and lifecycle;
 the [active plan](../QDRANT_IMPLEMENTATION_PLAN.md) owns milestone acceptance and
 verification evidence. Qdrant/catalog fixtures and container/recovery checks passed

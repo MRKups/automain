@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/MRKups/automain/internal/analysis"
@@ -84,7 +83,7 @@ type StatusReport struct {
 
 // Service coordinates domain operations across the CLI and HTTP API surfaces.
 type Service struct {
-	mu        sync.Mutex
+	mutations chan struct{}
 	cfg       config.Config
 	adapters  Adapters
 	retrieval *retrieval.Service
@@ -93,10 +92,43 @@ type Service struct {
 // NewService constructs the shared application service facade.
 func NewService(cfg config.Config, adapters Adapters) *Service {
 	return &Service{
+		mutations: make(chan struct{}, 1),
 		cfg:       cfg,
 		adapters:  adapters,
 		retrieval: retrieval.New(adapters.Store, adapters.Catalog, adapters.Vectors, adapters.Embedder),
 	}
+}
+
+// One mutation owns the service through its remote effects. Waiting callers can
+// leave on cancellation without taking ownership or starting downstream work.
+func (s *Service) acquireMutation(ctx context.Context, operation string) error {
+	if err := ctx.Err(); err != nil {
+		return mutationCanceled(operation, err)
+	}
+	if s.mutations == nil {
+		return domain.NewError(domain.ErrorCodeNotConfigured, operation,
+			"Mutation execution is not initialized.", "Construct the application service before invoking mutations.", nil)
+	}
+	select {
+	case s.mutations <- struct{}{}:
+		// The slot and cancellation can become ready together. Do not start an
+		// operation whose context expired while ownership was being granted.
+		if err := ctx.Err(); err != nil {
+			s.releaseMutation()
+			return mutationCanceled(operation, err)
+		}
+		return nil
+	case <-ctx.Done():
+		return mutationCanceled(operation, ctx.Err())
+	}
+}
+
+func (s *Service) releaseMutation() { <-s.mutations }
+
+func mutationCanceled(operation string, cause error) error {
+	return domain.NewError(domain.ErrorCodeExternalUnavailable, operation,
+		"Operation was canceled or timed out before mutation execution.",
+		"Retry explicitly if still needed; no queued mutation was started.", cause)
 }
 
 // Status returns the current configuration projection and wired adapter states.
@@ -163,7 +195,7 @@ func (s *Service) Status(ctx context.Context) (StatusReport, error) {
 // Sync imports repository issues, pull requests, discussions, and comments.
 func (s *Service) Sync(ctx context.Context, opts domain.SyncOptions) (domain.SyncResult, error) {
 	if err := ctx.Err(); err != nil {
-		return domain.SyncResult{}, domain.AsError("sync", err)
+		return domain.SyncResult{}, mutationCanceled("sync", err)
 	}
 	repo := s.resolveRepo(opts.Repository)
 	if err := requireRepo("sync", repo); err != nil {
@@ -191,8 +223,10 @@ func (s *Service) Sync(ctx context.Context, opts domain.SyncOptions) (domain.Syn
 		)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := s.acquireMutation(ctx, "sync"); err != nil {
+		return domain.SyncResult{}, err
+	}
+	defer s.releaseMutation()
 
 	opts.Repository = repo
 	if !opts.Full {
@@ -220,7 +254,7 @@ func (s *Service) Sync(ctx context.Context, opts domain.SyncOptions) (domain.Syn
 // Analyze classifies dirty items, discovers candidate threads, and persists verified relationships.
 func (s *Service) Analyze(ctx context.Context, opts domain.AnalyzeOptions) (domain.AnalyzeResult, error) {
 	if err := ctx.Err(); err != nil {
-		return domain.AnalyzeResult{}, domain.AsError("analyze", err)
+		return domain.AnalyzeResult{}, mutationCanceled("analyze", err)
 	}
 	repo := s.resolveRepo(opts.Repository)
 	if err := requireRepo("analyze", repo); err != nil {
@@ -247,8 +281,10 @@ func (s *Service) Analyze(ctx context.Context, opts domain.AnalyzeOptions) (doma
 	if s.adapters.Store == nil {
 		return domain.AnalyzeResult{}, storageNotConfiguredError("analyze")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := s.acquireMutation(ctx, "analyze"); err != nil {
+		return domain.AnalyzeResult{}, err
+	}
+	defer s.releaseMutation()
 
 	activeFinder := s.adapters.Finder
 	if overrideFinder := strings.ToLower(strings.TrimSpace(opts.Finder)); overrideFinder != "" {
@@ -697,7 +733,7 @@ func (s *Service) GetRelationship(ctx context.Context, id domain.RelationshipID)
 // VerifyRelationship sets human verification status on a relationship.
 func (s *Service) VerifyRelationship(ctx context.Context, id domain.RelationshipID, verified bool) (domain.Relationship, error) {
 	if err := ctx.Err(); err != nil {
-		return domain.Relationship{}, domain.AsError("relationships.verify", err)
+		return domain.Relationship{}, mutationCanceled("relationships.verify", err)
 	}
 	if strings.TrimSpace(string(id)) == "" {
 		return domain.Relationship{}, domain.NewError(
@@ -711,8 +747,10 @@ func (s *Service) VerifyRelationship(ctx context.Context, id domain.Relationship
 	if s.adapters.Store == nil {
 		return domain.Relationship{}, storageNotConfiguredError("relationships.verify")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := s.acquireMutation(ctx, "relationships.verify"); err != nil {
+		return domain.Relationship{}, err
+	}
+	defer s.releaseMutation()
 	rel, err := s.adapters.Store.VerifyRelationship(ctx, id, verified)
 	if err != nil {
 		return domain.Relationship{}, domain.AsError("relationships.verify", err)

@@ -167,6 +167,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	cleanPath := path.Clean("/" + strings.TrimSpace(r.URL.Path))
+	timeout := s.timeout
+	switch cleanPath {
+	case "/readyz", "/api/ready", "/api/readyz", "/api/v1/ready", "/api/v1/readyz":
+		timeout = min(timeout, 5*time.Second)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
+	r = r.WithContext(ctx)
+	if err := boundRequestRead(w, r); err != nil {
+		w.Header().Set("Connection", "close")
+		writeAPIError(w, "serve", err)
+		return
+	}
+	// Leave the deadline in place through net/http's unread-body cleanup, which
+	// can run after this handler returns. net/http resets it for idle/next reads.
+	if err := ctx.Err(); err != nil {
+		w.Header().Set("Connection", "close")
+		writeAPIError(w, "serve", err)
+		return
+	}
 	if cleanPath == "/healthz" {
 		s.handleHealth(w, r)
 		return
@@ -197,11 +217,6 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, cleanPath stri
 	}
 
 	reqCtx := r.Context()
-	var cancel context.CancelFunc
-	if s.timeout > 0 {
-		reqCtx, cancel = context.WithTimeout(reqCtx, s.timeout)
-		defer cancel()
-	}
 
 	subPath := strings.TrimPrefix(cleanPath, "/api")
 	if subPath == "/v1" || strings.HasPrefix(subPath, "/v1/") {
@@ -427,7 +442,7 @@ func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), min(s.timeout, 5*time.Second))
 	defer cancel()
 	if err := s.svc.Readiness(ctx); err != nil {
-		writeAPIErrorWithStatus(w, http.StatusServiceUnavailable, "readiness", domain.AsError("readiness", err))
+		writeAPIErrorWithStatus(w, http.StatusServiceUnavailable, "readiness", transportError("readiness", err))
 		return
 	}
 	writeAPISuccess(w, http.StatusOK, "readiness", map[string]string{"status": "ready"})
@@ -990,12 +1005,9 @@ func decodeOptionalJSONBody(r *http.Request, dst any) error {
 	if r.Body == nil || r.ContentLength == 0 {
 		return nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
+	raw, err := readRequestBody(r, maxRequestBodyBytes)
 	if err != nil {
 		return err
-	}
-	if len(raw) > maxRequestBodyBytes {
-		return fmt.Errorf("request body exceeds maximum size of %d bytes", maxRequestBodyBytes)
 	}
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" {
@@ -1044,7 +1056,7 @@ func writeAPISuccess(w http.ResponseWriter, statusCode int, command string, data
 }
 
 func writeAPIError(w http.ResponseWriter, command string, err error) {
-	domErr := domain.AsError(command, err)
+	domErr := transportError(command, err)
 	writeAPIErrorWithStatus(w, httpStatusForError(domErr), command, domErr)
 }
 

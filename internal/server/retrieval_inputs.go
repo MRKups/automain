@@ -18,12 +18,9 @@ func decodeRetrievalJSONBody(r *http.Request, dst any, fields ...string) error {
 	if r.Body == nil {
 		return nil
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodyBytes+1))
+	raw, err := readRequestBody(r, maxRequestBodyBytes)
 	if err != nil {
-		return fmt.Errorf("read request body: %w", err)
-	}
-	if len(raw) > maxRequestBodyBytes {
-		return fmt.Errorf("request body exceeds maximum size of %d bytes", maxRequestBodyBytes)
+		return err
 	}
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil

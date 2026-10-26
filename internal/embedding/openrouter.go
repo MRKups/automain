@@ -7,8 +7,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"unicode/utf8"
@@ -67,7 +69,7 @@ func (c *OpenRouter) ValidateConfig() error {
 
 func (c *OpenRouter) Embed(ctx context.Context, purpose domain.EmbeddingPurpose, texts []string) ([][]float32, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, domain.AsError("embedding", err)
+		return nil, requestFailure(ctx, err)
 	}
 	if err := c.ValidateConfig(); err != nil {
 		return nil, err
@@ -111,10 +113,7 @@ func (c *OpenRouter) Embed(ctx context.Context, purpose domain.EmbeddingPurpose,
 	req.Header.Set("User-Agent", "automain/0.1.0-dev")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, domain.AsError("embedding", ctx.Err())
-		}
-		return nil, unavailable("OpenRouter embedding request failed.", "Check connectivity and the embedding endpoint, then retry explicitly.", err)
+		return nil, requestFailure(ctx, err)
 	}
 	defer closeBody(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -124,7 +123,7 @@ func (c *OpenRouter) Embed(ctx context.Context, purpose domain.EmbeddingPurpose,
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return nil, unavailable("Could not read the OpenRouter embedding response.", "Retry explicitly after checking network connectivity.", err)
+		return nil, requestFailure(ctx, err)
 	}
 	if len(body) > maxResponseBytes {
 		return nil, unavailable("OpenRouter embedding response exceeded the size limit.", "Use smaller embedding batches.", nil)
@@ -161,6 +160,24 @@ func (c *OpenRouter) Embed(ctx context.Context, purpose domain.EmbeddingPurpose,
 		vectors[*entry.Index] = v
 	}
 	return vectors, nil
+}
+
+func requestFailure(ctx context.Context, cause error) error {
+	if ctx.Err() != nil {
+		// Keep transport errors and both standard and caller-supplied cancellation causes.
+		cause = errors.Join(cause, ctx.Err(), context.Cause(ctx))
+	}
+	message := "OpenRouter embedding request failed."
+	recovery := "Check connectivity, embedding endpoint, and timeout; retry explicitly. No automatic retry was made."
+	var networkError net.Error
+	switch {
+	case errors.Is(cause, context.Canceled):
+		message = "OpenRouter embedding request was cancelled."
+		recovery = "Retry explicitly with an active context. No automatic retry was made."
+	case errors.Is(cause, context.DeadlineExceeded) || (errors.As(cause, &networkError) && networkError.Timeout()):
+		message = "OpenRouter embedding request timed out."
+	}
+	return unavailable(message, recovery, cause)
 }
 
 func statusError(status int) error {

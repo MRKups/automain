@@ -68,7 +68,7 @@ The snapshot reflects local storage, not a fresh fetch from GitHub.
 `embed` validates provider configuration, prepares passages, registers the selected
 embedding space, and reconciles remote presence/deletions before pending work.
 It checks every catalog-indexed passage for remote presence across registered
-spaces. Pending passages already present with matching payloads are reused;
+spaces. Pending passages already present with matching payloads and valid dense vectors are reused;
 only missing vectors are requested, in batches of up to 32. The work limit defaults
 to 100, accepts 1-10000, and counts newly embedded plus reused pending passages,
 not items or the cost of scanning existing receipts. Repeat to finish pending work.
@@ -109,9 +109,8 @@ embedding, Jev, or chat calls and needs no provider key. It does not recreate lo
 vectors. Restore Qdrant or migrate compatible legacy vectors first if available;
 `index embed` can regenerate genuinely missing vectors at provider cost.
 
-Payload-only points are an exception: current presence checks do not detect a
-missing dense vector, so reconciliation and migration cannot repair that state.
-See the [Qdrant recovery defect](../storage/qdrant/README.md#storage-and-queries).
+Payload-only points also become pending. Presence requires a valid dense vector,
+not just surviving metadata. See [Qdrant presence checks](../storage/qdrant/README.md#storage-and-queries).
 
 Preparation works during Qdrant outages; reconcile/embed/search/similar fail clearly
 without hidden lexical, SQLite-vector, or LLM fallback. Restore Qdrant, reconcile,
@@ -119,7 +118,7 @@ and retry. Never delete source data or an existing vector cache to recover.
 
 ## Legacy-vector migration
 
-Stop the old writer and preserve the original `vectors.db`, required WAL/SHM
+Stop the old writer and preserve the original `vectors.db`, all existing SQLite
 sidecars, and a consistent backup. Keep source, new catalog, and legacy input paths
 distinct. With the current canonical source database selected and Qdrant available:
 
@@ -130,11 +129,11 @@ automain index status --repo owner/name --json
 automain index reconcile --repo owner/name --json
 ```
 
-The old database uses a read-only SQLite connection and is not initialized,
-rewritten, or deleted. However, cleanly closed WAL-mode inputs can currently fail
-after an empty sidecar is created. See the [legacy reader defect](../storage/vector/README.md#accepted-files-and-ownership)
-before attempting migration; do not use your only copy or remove the WAL. Deprecated `--vector-db` does not
-activate migration or select production vector storage.
+The reader opens a private temporary copy, never the original database through
+SQLite. Originals and sidecars remain unchanged, including on failure or cancellation.
+Keep the writer stopped during copying and allow temporary disk space for the
+snapshot. See [legacy reader ownership](../storage/vector/README.md#accepted-files-and-ownership).
+Deprecated `--vector-db` does not activate migration or select production vector storage.
 
 Migration prepares the current catalog, then copies only vectors whose passage
 identity/content fingerprint still matches. It preserves space identities and

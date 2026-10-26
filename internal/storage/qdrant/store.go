@@ -128,7 +128,7 @@ func malformed(op string) error {
 }
 
 func missing(op string) error {
-	return domain.NewError(domain.ErrorCodeNotFound, op, "The stored query passage is missing or stale.", "Run index embed to reconcile the passage, then retry.", nil)
+	return domain.NewError(domain.ErrorCodeNotFound, op, "The stored query passage or its dense vector is missing or stale.", "Run index reconcile, then restore or migrate saved vectors, or run index embed, before retrying similarity.", nil)
 }
 
 func missingCollection(op string, err error) error {

@@ -100,7 +100,7 @@ it the CLI prints just the typed result as JSON. HTTP also accepts `/api/v1/deci
 
 The common binary factory still opens/migrates both configured SQLite files.
 The `Decide` operation itself has no storage reads or writes and does not take
-the mutation mutex. Nothing is cached: every explicit successful call is a new
+mutation ownership. Nothing is cached: every explicit successful call is a new
 paid request. Save the returned output yourself if experimenting with thresholds.
 
 ## Safeguards and failures

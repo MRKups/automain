@@ -8,7 +8,7 @@ source records and relationships; Qdrant 1.20.0 supplies semantic retrieval.
 ## Current state
 
 - GitHub import and thread/relationship inspection are available through CLI,
-  API, and UI. [Import coverage](docs/ingestion.md#coverage-limits) is limited.
+  API, and UI. [Import coverage](internal/github/README.md#current-limits) is limited.
 - Text search uses Gemini embeddings through OpenRouter. `similar` reuses stored
   vectors without model calls. Both return source passages, not relationship verdicts.
 - Canonical `automain.db`, metadata-only `index.db`, Qdrant storage, explicit
@@ -21,11 +21,6 @@ source records and relationships; Qdrant 1.20.0 supplies semantic retrieval.
 
 The version is `0.1.0-dev`. Checks made no paid model calls and migrated no live
 data. They do not establish release readiness or semantic/relationship accuracy.
-
-**Review found six open defects**, including WAL migration, missing-vector recovery,
-and Compose configuration parity. See the [review follow-up](QDRANT_IMPLEMENTATION_PLAN.md#review-follow-up)
-before migrating existing data or relying on recovery. Passing fixtures did not cover
-these cases; the defects have not yet been fixed.
 
 ## Quick start
 
@@ -76,8 +71,7 @@ does not select active vector storage.
 
 ## Guides
 
-- [Documentation index](docs/README.md), [architecture](docs/architecture.md),
-  and [implementation map](internal/README.md).
+- [Implementation map](internal/README.md) and the focused guides linked from it.
 - [Retrieval and migration](internal/retrieval/README.md),
   [storage/recovery](internal/storage/README.md), and
   [configuration](internal/config/README.md).

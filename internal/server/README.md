@@ -106,29 +106,31 @@ not necessarily forwarded as the same HTTP status.
   protect the service externally. Exposing it permits reads, writes, and paid
   model calls. Migration also permits reading a caller-selected local legacy
   SQLite file accessible to the server. Setting `PORT` without an explicit address binds all interfaces.
-- Operations run synchronously, not as background jobs. Mutation operations share
-  a per-service lock, including time spent waiting on providers.
-- `--timeout` controls request contexts (default 60s). The HTTP write timeout is
-  independently fixed at **120s**. Raising `--timeout` does not raise that limit;
-  prefer bounded batches or the CLI for long work.
+- Operations run synchronously, not as background jobs. Mutations are serialized
+  per service, including provider calls; queued requests can leave on cancellation
+  without starting downstream work. See [mutation ownership](../app/README.md#concurrency-and-partial-progress).
+- `--timeout` bounds request contexts and socket body reads (default 60s), including
+  decision, retrieval, and legacy JSON bodies. Body-read timeouts return
+  `external_unavailable` (502) when a response can still be written; malformed JSON
+  remains `invalid_input` (400). The deadline also bounds unread-body cleanup.
+  The HTTP write timeout is independently fixed at **120s**. Raising `--timeout`
+  does not raise that limit; prefer bounded batches or the CLI for long work.
 - Read-header timeout is 10s, idle timeout 60s, shutdown grace 10s.
-- **Known defect (R5):** stalled body reads can outlive the operation context because
-  there is no body-read deadline. They retain a handler/socket and can delay shutdown;
-  the byte limits do not bound read duration. This existing server limitation also
-  affects the new retrieval and decision endpoints.
 - Liveness is not a live GitHub/OpenRouter credential or availability check.
 - Readiness checks local storage and Qdrant with a deadline of at most five seconds,
   without model calls. Qdrant failure does not change liveness or disable offline operations.
+- These read bounds also apply when embedding `server.New` in a standard Go HTTP
+  server. Network middleware must expose response-controller methods or `Unwrap`.
+  In-memory response writers without deadline support still accept finite bodies;
+  arbitrary blocking readers without socket deadline support cannot be interrupted.
 
 `POST /api/decide` makes a paid Jev request and returns typed decisions, full
 probabilities, model revision, and usage/cost. It does not write relationships or
 run search/legacy analysis. It uses the server's key and does not take the storage
-mutation mutex. No automatic retry, redirect, or LLM fallback is made.
+mutation ownership. No automatic retry, redirect, or LLM fallback is made.
 
 Rebuild frontend assets and then the binary to change the served UI. See
 [web development](../../web/README.md).
 
-The [review follow-up](../../QDRANT_IMPLEMENTATION_PLAN.md#review-follow-up) also tracks
-mutation-queue cancellation and embedding timeout error classification. An expired
-embedding operation can currently surface as `internal_error`/HTTP 500 instead of
-the expected external-provider error.
+Provider timeout errors retain their operation and recovery details through HTTP;
+embedding timeouts return `external_unavailable` (502), not an internal error.

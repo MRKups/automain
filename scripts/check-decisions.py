@@ -2,17 +2,20 @@
 """Offline Jev plumbing checks using only a loopback Decisions API fixture."""
 
 import copy
+from http.client import HTTPResponse
 import http.server
 import json
 import os
 from pathlib import Path
 import selectors
+import socket
 import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -115,6 +118,8 @@ def main():
         worker = threading.Thread(target=mock.serve_forever, daemon=True)
         worker.start()
         env["AUTOMAIN_DECISION_ENDPOINT"] = f"http://127.0.0.1:{mock.server_port}/api/alpha/decisions"
+        env["AUTOMAIN_EMBEDDING_BASE_URL"] = f"http://127.0.0.1:{mock.server_port}/api/v1"
+        env["AUTOMAIN_LLM_BASE_URL"] = f"http://127.0.0.1:{mock.server_port}/api/v1"
 
         def cli(*args, code=0):
             result = subprocess.run([str(binary), *args, "--json"], cwd=sandbox, env=env,
@@ -295,12 +300,12 @@ def main():
             mock.server_close()
             worker.join(timeout=5)
         print("Decision checks passed: Jev wire format, typed answers, probabilities, configuration,")
-        print("CLI/HTTP wiring, input/response validation, safe failures, timeouts, and no storage writes.")
+        print("CLI/HTTP wiring, input/response validation, safe failures, provider/body deadlines, and no storage writes.")
         print("Only a local mock Decisions API was used; no live or paid model calls.")
 
 
 def check_http(binary, sandbox, env, state):
-    process = subprocess.Popen([str(binary), "serve", "--listen", "127.0.0.1:0"], cwd=sandbox,
+    process = subprocess.Popen([str(binary), "serve", "--listen", "127.0.0.1:0", "--timeout", "500ms"], cwd=sandbox,
                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         with selectors.DefaultSelector() as selector:
@@ -335,9 +340,32 @@ def check_http(binary, sandbox, env, state):
         http(payload=b"x" * 30001, status=400)
         http(payload=json.dumps({**REQUEST, "model": "override"}).encode(), status=400)
         assert len(state["requests"]) == calls
+        address = urllib.parse.urlsplit(url)
+        with socket.create_connection((address.hostname, address.port), timeout=2) as connection:
+            connection.settimeout(2)
+            started = time.monotonic()
+            connection.sendall((f"POST /api/decide HTTP/1.1\r\nHost: {address.netloc}\r\n"
+                                "Content-Type: application/json\r\nContent-Length: 1000\r\n"
+                                "Connection: close\r\n\r\n{").encode())
+            # No EOF: the handler must stop waiting for the rest of this body.
+            response = HTTPResponse(connection)
+            response.begin()
+            with response:
+                result = json.loads(response.read())
+                assert response.status == 502, (response.status, result)
+                assert not result["ok"] and result["error"]["code"] == "external_unavailable", result
+            assert time.monotonic() - started < 2, "partial decision body outlived the request deadline"
+        assert len(state["requests"]) == calls, "partial decision body reached the provider"
         state["mode"] = 429
         assert http(payload=payload, status=502)["error"]["code"] == "external_unavailable"
+        state["mode"] = "slow"
+        calls = len(state["requests"])
+        started = time.monotonic()
+        assert http(payload=payload, status=502)["error"]["code"] == "external_unavailable"
+        assert time.monotonic() - started < 2, "provider deadline did not bound HTTP decisions"
+        assert len(state["requests"]) == calls + 1, "HTTP decision timeout retried or bypassed the provider"
         state["mode"] = "ok"
+        assert http(payload=payload)["ok"]
     finally:
         process.terminate()
         stdout, stderr = process.communicate(timeout=15)

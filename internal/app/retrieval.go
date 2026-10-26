@@ -11,8 +11,10 @@ import (
 
 // PrepareIndex only copies/chunks source text into the metadata-only catalog.
 func (s *Service) PrepareIndex(ctx context.Context, repo string) (domain.IndexResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := s.acquireMutation(ctx, "index.prepare"); err != nil {
+		return domain.IndexResult{}, err
+	}
+	defer s.releaseMutation()
 	result, err := s.retrieval.Prepare(ctx, s.resolveRepo(repo))
 	if err != nil {
 		return result, domain.AsError("index.prepare", err)
@@ -31,8 +33,10 @@ func (s *Service) IndexStatus(ctx context.Context, repo string) (domain.IndexSta
 // EmbedIndex prepares source passages and embeds pending work with the injected provider.
 // It does not run relationship analysis, even when LLM credentials are configured.
 func (s *Service) EmbedIndex(ctx context.Context, repo string, limit int) (domain.IndexResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := s.acquireMutation(ctx, "index.embed"); err != nil {
+		return domain.IndexResult{}, err
+	}
+	defer s.releaseMutation()
 	result, err := s.retrieval.Embed(ctx, s.resolveRepo(repo), limit)
 	if err != nil {
 		return result, domain.AsError("index.embed", err)
@@ -56,8 +60,10 @@ func (s *Service) Similar(ctx context.Context, opts domain.SimilarOptions) (doma
 }
 
 func (s *Service) ReconcileIndex(ctx context.Context, repo string) (domain.IndexResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := s.acquireMutation(ctx, "index.reconcile"); err != nil {
+		return domain.IndexResult{}, err
+	}
+	defer s.releaseMutation()
 	result, err := s.retrieval.Reconcile(ctx, s.resolveRepo(repo))
 	return result, wrapRetrievalError("index.reconcile", err)
 }
@@ -84,8 +90,10 @@ func (s *Service) MigrateIndex(ctx context.Context, repo, path string, limit int
 	if err := paths.ValidateDatabasePaths(); err != nil {
 		return result, domain.NewError(domain.ErrorCodeInvalidInput, "index.migrate", err.Error(), "Use distinct canonical, catalog, and preserved legacy vector files.", err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	if err := s.acquireMutation(ctx, "index.migrate"); err != nil {
+		return result, err
+	}
+	defer s.releaseMutation()
 	legacy, err := s.adapters.OpenLegacy(ctx, path)
 	if err != nil {
 		return result, domain.AsError("index.migrate", err)

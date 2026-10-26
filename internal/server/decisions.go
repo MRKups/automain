@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"io"
 	"mime"
 	"net/http"
 
@@ -19,9 +18,9 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request, ctx contex
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, domain.MaxDecisionRequestBytes)
-	data, err := io.ReadAll(r.Body)
+	data, err := readRequestBody(r, domain.MaxDecisionRequestBytes)
 	if err != nil {
-		writeAPIError(w, "decide", domain.NewError(domain.ErrorCodeInvalidInput, "decide", "Cannot read decision body or body exceeds the 30000-byte budget.", "Send bounded JSON; input is never truncated.", nil))
+		writeAPIError(w, "decide", domain.NewError(domain.ErrorCodeInvalidInput, "decide", "Cannot read decision body or body exceeds the 30000-byte budget.", "Send bounded JSON; input is never truncated.", err))
 		return
 	}
 	input, err := domain.DecodeDecisionRequest(data)

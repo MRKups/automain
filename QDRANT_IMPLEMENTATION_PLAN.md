@@ -1,29 +1,29 @@
 # Automain: Qdrant and Containerization Plan
 
-Status: phases 1-5 implemented with passing fixtures, but six subsequent review
-findings remain open, October 26, 2026. Acceptance is not complete for the affected
-migration, recovery, configuration, and deadline guarantees. The restored
-[architecture](docs/architecture.md) owns product direction and boundaries; this
+Status: phases 1-5 implemented; six review findings fixed and independently
+verified with disposable fixtures, October 26, 2026. Local
+`docs/architecture.md` owns product direction and boundaries; this
 document owns the game plan, migration work, and acceptance checks.
 
 ## Review follow-up
 
-The implementation is being preserved with these known defects, not represented
-as a release-ready cutover. Existing fixture results below remain historical evidence;
-the broader review exercised cases those checks missed. No fixes are included yet.
+All six findings are resolved. Review added cases the original acceptance fixtures
+missed, including a hot rollback journal that could expose uncommitted vectors.
+These checks do not establish production cutover safety or semantic quality.
 
-| ID | Open defect and owning guide | Required verification before closure |
+| ID | Fix and owning guide | Observed verification |
 | --- | --- | --- |
-| R1 | [Legacy WAL reader](internal/storage/vector/README.md#accepted-files-and-ownership) can fail and create a sidecar after clean shutdown | Clean/stopped WAL inputs migrate without any source or sidecar changes |
-| R2 | [Qdrant presence](internal/storage/qdrant/README.md#storage-and-queries) accepts payloads without vectors | Vector-only loss becomes pending and saved vectors restore it without inference |
-| R3 | [Compose configuration](deployment/README.md#start-and-inspect) drops supported legacy credentials/endpoints and forces the wrong default model | Host/container provider, credential presence, model, and endpoint resolution agree |
-| R4 | [Mutation queue](internal/app/README.md#concurrency-and-partial-progress) ignores cancellation while waiting | Canceled queued operations return before the active provider call finishes |
-| R5 | [HTTP body reads](internal/server/README.md#deployment-limits) can outlive operation deadlines | Stalled decision/retrieval bodies terminate within the configured request bound |
-| R6 | [Embedding timeouts](internal/embedding/README.md#failures-and-cost) become internal errors | CLI/API classify provider deadlines as external failures, without retries |
+| R1 | [Legacy reader](internal/storage/vector/README.md#accepted-files-and-ownership) uses a private snapshot and rejects existing rollback journals | Clean/stopped WAL, missing SHM, read-only sources, cancellation, and failed opens preserve originals; hot-journal reproduction rejects before copying; committed float32 vectors remain exact |
+| R2 | [Qdrant presence](internal/storage/qdrant/README.md#storage-and-queries) validates actual dense vectors | Vector-only loss becomes pending; legacy migration restores it with zero provider calls; explicit similarity fails safely before repair |
+| R3 | [Compose configuration](deployment/README.md#legacy-analysis-configuration) forwards supported legacy credentials/models/endpoints | 51 sanitized host/container cases agree on provider, key presence, model, and endpoint; Qdrant receives no provider settings |
+| R4 | [Mutation waiting](internal/app/README.md#concurrency-and-partial-progress) honors cancellation | All seven queued mutation operations return before the active provider call exits, with zero downstream effects; valid work remains serialized under race checks |
+| R5 | [HTTP body reads](internal/server/README.md#deployment-limits) share the request deadline | Stalled decision/retrieval/legacy POST bodies return bounded 502 errors; keep-alive reuse and shutdown checks pass |
+| R6 | [Embedding timeouts](internal/embedding/README.md#failures-and-cost) retain external-error classification through HTTP | CLI/API preserve operation `embedding` and useful diagnostics; adapter errors retain cancellation causes; deadlines and client/body timeouts make no automatic retries |
 
 ## Reconciliation with restored design docs
 
-The restored [documentation index](docs/README.md) links the updated contracts.
+The restored local `docs/README.md` links the updated contracts; the shipped
+[implementation map](internal/README.md) links the maintained package guides.
 The contributor/development policy and canonical evidence requirements remain
 in force. `development.md` and `documentation-style.md` were restored unchanged.
 
@@ -163,11 +163,11 @@ the SQLite `Open` call while retaining assumptions about one atomic database.
 
 | Phase | Work | Completion gate | Status |
 | --- | --- | --- | --- |
-| 1. Storage boundaries | Catalog/vector contracts, IDs, lifecycle, progress, cleanup | Offline preparation; canonical state unchanged | Implemented; R4 open |
-| 2. Qdrant adapter | Collections, indexes, upserts/deletion, vector/stored-ID queries | Real Qdrant 1.20 fixtures, no paid model calls | Implemented; R2 open |
-| 3. Wiring and migration | Retrieval/config/status, legacy import, item grouping | Vector reuse, restart/recovery, freshness | Implemented; R1, R5, R6 open |
-| 4. Containers | Images, Compose, volumes, networking, health | Fresh startup, UI/API, persistence and restore | Implemented; R3 open |
-| 5. Operational handoff | Env examples, tasks, guides, migration/backup instructions | Checks and local documentation links pass | Updated with open review findings |
+| 1. Storage boundaries | Catalog/vector contracts, IDs, lifecycle, progress, cleanup | Offline preparation; canonical state unchanged | Complete |
+| 2. Qdrant adapter | Collections, indexes, upserts/deletion, vector/stored-ID queries | Real Qdrant 1.20 fixtures, no paid model calls | Complete |
+| 3. Wiring and migration | Retrieval/config/status, legacy import, item grouping | Vector reuse, restart/recovery, freshness | Complete |
+| 4. Containers | Images, Compose, volumes, networking, health | Fresh startup, UI/API, persistence and restore | Complete |
+| 5. Operational handoff | Env examples, tasks, guides, migration/backup instructions | Checks and local documentation links pass | Complete |
 | Later, separate milestone | Explicit Jev relationship policy | Reviewed questions/thresholds before writes or automation | Deferred |
 
 ### Implementation progress
@@ -175,8 +175,9 @@ the SQLite `Open` call while retaining assumptions about one atomic database.
 The initial interface-only slice has been superseded by physical catalog/Qdrant
 separation. Production no longer uses the old paired SQLite vector backend.
 
-Independent verification passed these fixture suites, including the then-known
-missing/empty-collection and source-append regression reruns:
+Independent verification passed these checks after the review fixes, including
+rollback-journal refusal, dense-vector-only loss, bounded request bodies, and
+preserved CLI/API embedding timeout diagnostics:
 
 ```sh
 task check
@@ -205,6 +206,10 @@ readiness/liveness, embedded assets, non-root SQLite permissions, restart/down-u
 persistence, Qdrant outage behavior, and stopped-volume backup/restore into fresh
 volumes. These are operational fixture checks, not semantic-quality or capacity
 measurements. Real remote TLS deployment and hardware power-loss timing were not tested.
+
+The final production-image/Compose smoke was repeated after the review fixes with
+synthetic settings. Qdrant 1.20.0 and app health, embedded assets, non-root execution,
+legacy provider configuration, secret isolation, and restart persistence passed.
 
 **Implemented components:**
 
@@ -245,7 +250,7 @@ and secrets stay redacted. Local links and protected documentation hashes passed
   `127.0.0.1:8080:8080` by default. Keep Qdrant's ports private to Compose.
 - Use one app instance and one mutation owner initially. While serving, perform
   mutations through its API rather than concurrent CLI indexing processes sharing
-  the same files. Do not claim that SQLite plus a process-local mutex supports
+  the same files. Do not claim that SQLite plus process-local mutation ownership supports
   horizontal app scaling or distributed indexing.
 - Add `.dockerignore`: exclude real env files, credentials, databases, local build
   outputs, and dependency directories; retain source and build manifests.
@@ -276,13 +281,17 @@ and secrets stay redacted. Local links and protected documentation hashes passed
 - [x] Source SQLite contains no vectors; the catalog contains no vector blobs.
 - [x] Preparation works with Qdrant stopped and no provider keys.
 - [x] Indexing batches resume; unchanged content is reused; bad vectors are rejected.
-- [ ] Existing compatible embeddings migrate with **zero embedding API calls**, including clean WAL-mode inputs (R1).
+- [x] Existing compatible embeddings migrate with **zero embedding API calls**, including clean WAL-mode inputs; rollback-journal sources reject safely (R1).
 - [x] Text search calls only the query embedding provider, never Jev or a chat model.
 - [x] Stored-passage similarity calls **no embedding, Jev, or chat provider**.
 - [x] Grouped item candidates exclude the source item and retain exact source evidence.
 - [x] Repository/kind/space boundaries, UUID mapping, and collection compatibility hold.
 - [x] Changed/deleted sources and stale in-flight writes cannot produce current-looking hits.
-- [ ] Interrupted writes/deletions and missing/restored Qdrant vectors reconcile correctly, including payload-only points (R2).
+- [x] Interrupted writes/deletions and missing/restored Qdrant vectors reconcile correctly, including payload-only points (R2).
+- [x] Compose preserves supported legacy provider configuration and keeps provider secrets out of Qdrant (R3).
+- [x] Queued mutations honor cancellation without downstream work (R4).
+- [x] Stalled HTTP bodies are bounded by request deadlines (R5).
+- [x] Embedding cancellations/timeouts remain external failures through CLI/API, without automatic retries (R6).
 - [x] Qdrant outages yield safe errors; standalone Jev and non-vector operations still work.
 - [x] Ordinary restart or search does not create relationships or trigger legacy `analyze`.
 - [x] Static checks, existing decision checks, and updated retrieval checks pass.
@@ -337,8 +346,8 @@ Document shutdown, logs, backup/restore, migration, and non-destructive recovery
 Never recommend `docker compose down -v` as routine shutdown: it removes data volumes.
 
 **Next milestone:** decide how to apply Jev to specific relationship questions.
-First close R1-R6 and repeat the affected verification. Do not infer authorization
-for deferred automation, writing, UI, or scaling work from the implementation status.
+Do not infer authorization for deferred automation, writing, UI, or scaling work
+from completion of this milestone.
 
 ## References
 

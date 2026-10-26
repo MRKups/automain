@@ -8,14 +8,6 @@ lockfile, so rebuilding can select newer compatible frontend packages.
 
 ## Start and inspect
 
-**Known configuration defect (R3):** Compose does not preserve all supported legacy
-analysis settings. OpenAI/DeepSeek credential fallbacks and endpoint overrides are
-omitted, and an unset model becomes the Gemini model regardless of provider. A
-private gateway can silently become a public provider destination. Do not invoke
-containerized legacy `analyze` or its UI action with those configurations until the
-[review fix](../QDRANT_IMPLEMENTATION_PLAN.md#review-follow-up). Host configuration
-resolution is unaffected; embedding/Jev settings are separate.
-
 From the repository root:
 
 ```sh
@@ -50,6 +42,19 @@ again. Non-vector operations remain independent of Qdrant availability.
 
 Task aliases are `task compose:build`, `task compose:up`, `task compose:logs`,
 and `task compose:down`.
+
+## Legacy analysis configuration
+
+Compose explicitly forwards `AUTOMAIN_LLM_PROVIDER` and the `API_KEY`, `MODEL`,
+`API_URL`, and `BASE_URL` settings under each prefix: `AUTOMAIN_LLM_`, `GEMINI_`,
+`OPENAI_`, and `DEEPSEEK_`. Unset key, model, and endpoint overrides remain blank,
+so Go applies the same provider defaults, aliases, and fallback order as on the
+host. Generic endpoint overrides preserve private gateway URLs. See
+[legacy analysis configuration](../internal/config/README.md#legacy-relationship-analysis)
+for precedence; embedding and Jev settings remain separate.
+
+When switching providers from `.env.example`, clear or replace its explicit
+`AUTOMAIN_LLM_MODEL=gemini-2.5-flash` to avoid overriding the new provider's model.
 
 ## State and mutation ownership
 

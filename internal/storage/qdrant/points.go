@@ -92,7 +92,7 @@ func (s *Store) Existing(ctx context.Context, repo string, space domain.Embeddin
 		ids[i] = q.NewID(domain.PointID(chunk))
 		expected[domain.PointID(chunk)] = chunk
 	}
-	reply, err := s.client.Points().Get(ctx, &q.GetPoints{CollectionName: s.prefix + space.ID(), Ids: ids, WithPayload: q.NewWithPayload(true), WithVectors: q.NewWithVectors(false)})
+	reply, err := s.client.Points().Get(ctx, &q.GetPoints{CollectionName: s.prefix + space.ID(), Ids: ids, WithPayload: q.NewWithPayload(true), WithVectors: q.NewWithVectors(true)})
 	if status.Code(err) == codes.NotFound {
 		return found, nil
 	}
@@ -113,7 +113,11 @@ func (s *Store) Existing(ctx context.Context, repo string, space domain.Embeddin
 		if err != nil {
 			return nil, err
 		}
-		if sameEmbedding(chunk, want) {
+		present, err := storedVector(op, point.GetVectors(), space.Dimensions)
+		if err != nil {
+			return nil, err
+		}
+		if present && sameEmbedding(chunk, want) {
 			found[chunk.ID] = true
 		}
 	}
@@ -201,7 +205,7 @@ func (s *Store) SearchByChunk(ctx context.Context, repo string, space domain.Emb
 		return nil, missing(op)
 	}
 	id := q.NewID(domain.PointID(chunk))
-	reply, err := s.client.Points().Get(ctx, &q.GetPoints{CollectionName: s.prefix + space.ID(), Ids: []*q.PointId{id}, WithPayload: q.NewWithPayload(true), WithVectors: q.NewWithVectors(false)})
+	reply, err := s.client.Points().Get(ctx, &q.GetPoints{CollectionName: s.prefix + space.ID(), Ids: []*q.PointId{id}, WithPayload: q.NewWithPayload(true), WithVectors: q.NewWithVectors(true)})
 	if status.Code(err) == codes.NotFound {
 		return nil, missing(op)
 	}
@@ -222,10 +226,43 @@ func (s *Store) SearchByChunk(ctx context.Context, repo string, space domain.Emb
 	if err != nil {
 		return nil, err
 	}
-	if !sameEmbedding(stored, chunk) {
+	present, err := storedVector(op, point.GetVectors(), space.Dimensions)
+	if err != nil {
+		return nil, err
+	}
+	if !present || !sameEmbedding(stored, chunk) {
 		return nil, missing(op)
 	}
 	return s.query(ctx, op, repo, space, q.NewQueryID(id), limit, itemKey(chunk))
+}
+
+// Deleting only the unnamed vector leaves a valid payload and an empty vector
+// map. Treat that as missing so reconciliation and legacy migration can repair it.
+func storedVector(op string, vectors *q.VectorsOutput, dimensions int) (bool, error) {
+	vector := vectors.GetVector()
+	if vector == nil {
+		if len(vectors.GetVectors().GetVectors()) != 0 {
+			return false, malformed(op)
+		}
+		return false, nil
+	}
+	if vector.GetIndices() != nil || vector.VectorsCount != nil {
+		return false, malformed(op)
+	}
+	switch vector.GetVector().(type) {
+	case nil, *q.VectorOutput_Dense:
+	default:
+		return false, malformed(op)
+	}
+	// The official helper supports both Qdrant's legacy data field and dense oneof.
+	data := vector.GetDenseVector().GetData()
+	if len(data) == 0 {
+		return false, nil
+	}
+	if err := domain.ValidateVector(data, dimensions); err != nil {
+		return false, malformed(op)
+	}
+	return true, nil
 }
 
 func validateSearch(op, repo string, space domain.EmbeddingSpace, limit int) error {

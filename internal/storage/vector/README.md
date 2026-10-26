@@ -8,7 +8,7 @@ catalog or vector backend. Qdrant owns production vector storage.
 
 The reader makes no provider calls, reads no environment files, and does not
 initialize databases, apply migrations, change journal mode, or write passages/vectors.
-Its caller owns `Close`. The filesystem read-only guarantee has the open defect below.
+Its caller owns `Close` and the private snapshot's lifetime.
 
 ## Accepted files and ownership
 
@@ -23,25 +23,37 @@ Invalid paths, wrong ownership, and incompatible schemas return `invalid_input`
 (HTTP 400, CLI exit 2). Permission, corruption, and I/O failures return
 `external_unavailable` (HTTP 502, CLI exit 1), with the underlying cause preserved.
 
-SQLite opens with `mode=ro` and `readonly_shm=1`. The latter prevents writes to
-shared-memory sidecars while retaining committed WAL data, unlike `immutable=1`,
-which can ignore the WAL. Temporary SQLite work stays in memory. A WAL-mode
-database can require an existing readable SHM sidecar. Missing sidecars or a WAL
-that SQLite cannot safely read produce an error rather than a partial snapshot.
-Preserve the database, WAL, and SHM together, or use a consistent SQLite backup.
-Never remove the WAL to force migration.
+Stop the old writer before migration and keep the source files unchanged while
+opening the reader. This is a stopped-file copy, not an online backup protocol.
+An existing `-journal` rollback sidecar is rejected, even if empty: omitting a hot
+journal can expose uncommitted pages. Preserve the originals and recover a complete
+disposable copy with SQLite, or use a consistent backup. Never delete the original
+journal to force migration.
+The reader copies the main file and any existing `-wal` and `-shm` files read-only
+into a private, mode-0700 temporary directory. Only absent sidecars are optional;
+existing inputs must be readable regular files. The originals are never opened
+through SQLite, checkpointed, chmodded, deleted, or given new directory entries,
+including when opening fails or copying is canceled.
 
-**Known defect (R1):** opening a valid WAL-mode database after a clean writer shutdown
-can create an empty `-wal` sidecar and then fail. The main database stayed unchanged
-in the reproduction, but `mode=ro` and `readonly_shm=1` do not provide the promised
-filesystem boundary. Do not migrate your only copy. Preserve a consistent backup
-and wait for the [review fix](../../../QDRANT_IMPLEMENTATION_PLAN.md#review-follow-up)
-before relying on this migration path.
+SQLite opens only the copy with `mode=ro`. It may create or rebuild sidecars there,
+so clean WAL-mode databases without sidecars and committed WAL data without SHM
+remain readable. The reader does not use `immutable=1`, which can ignore WAL data.
+Other temporary SQLite work stays in memory. Preserve existing database/WAL/SHM
+files together, or use a consistent SQLite backup. Never remove the original WAL
+to force migration.
 
-Stop the old writer before migration. Each batch uses one connection and one
-read transaction, including its space lookup and embedding rows. There is no
-cross-batch snapshot or transaction with the canonical database, catalog, or
-Qdrant. A changing legacy index cannot provide repeatable keyset traversal.
+Every open needs fresh temporary storage for the main database and existing
+sidecars, plus space for SQLite's copied-sidecar work. Ensure the OS temporary
+directory (selected by `TMPDIR` where supported) is writable and has enough free
+space. Copying checks cancellation between bounded chunks. Failed opens and
+`Close` remove only that reader's private directory; cleanup failures report its
+path for manual removal after the reader closes. A process crash can leave a
+private copy behind. No automatic cleanup touches the originals.
+
+All batches read the same private file set until `Close`. Each batch uses one
+connection and one read transaction, including its space lookup and embedding
+rows. There is no shared transaction with the canonical database, catalog, or
+Qdrant. A later open takes a fresh copy.
 
 ## Reading and validation
 

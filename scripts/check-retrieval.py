@@ -3,12 +3,14 @@
 
 from contextlib import contextmanager
 import hashlib
+import http.client
 import http.server
 import json
 import math
 import os
 from pathlib import Path
 import selectors
+import socket
 import sqlite3
 import struct
 import subprocess
@@ -143,13 +145,23 @@ def openrouter_fixture():
                 elif mode == "huge_number":
                     data[0]["embedding"][0] = 1e100
                 body = json.dumps(response).encode() if mode != "malformed" else b"not JSON"
+                if mode == "slow_headers":
+                    time.sleep(1.2)
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 if status == 307:
                     self.send_header("Location", "/must-not-follow")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
+                if mode == "slow_body":
+                    self.wfile.write(body[:1])
+                    self.wfile.flush()
+                    time.sleep(1.2)
+                    body = body[1:]
                 self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                # Deadline checks deliberately disconnect before a delayed reply.
+                pass
             except Exception as error:
                 state["errors"].append(repr(error))
                 self.send_error(500)
@@ -291,7 +303,10 @@ def main():
 
         with qdrant_container() as (rest, grpc), openrouter_fixture() as (state, base_url):
             env.update(AUTOMAIN_QDRANT_PORT=str(grpc), AUTOMAIN_QDRANT_API_KEY=QDRANT_KEY,
-                       OPENROUTER_API_KEY=PROVIDER_KEY, AUTOMAIN_EMBEDDING_BASE_URL=base_url)
+                       OPENROUTER_API_KEY=PROVIDER_KEY, AUTOMAIN_EMBEDDING_BASE_URL=base_url,
+                       AUTOMAIN_DECISION_ENDPOINT=base_url + "/decisions",
+                       AUTOMAIN_LLM_PROVIDER="openai", AUTOMAIN_LLM_API_KEY=PROVIDER_KEY,
+                       AUTOMAIN_LLM_BASE_URL=base_url)
             remote = Remote(rest, prefix)
             check_retrieval(sandbox, source, catalog, env, cli, state, remote)
             check_inflight(source, env, cli, state)
@@ -316,8 +331,8 @@ def main():
             assert db.execute("SELECT COUNT(*) FROM relationships").fetchone()[0] == 0
             assert db.execute("SELECT COUNT(*) FROM threads").fetchone()[0] == 0
         print("Retrieval checks passed: real authenticated Qdrant 1.20.0, exact cosine parity, repository/space isolation,")
-        print("stored-vector similarity, grouped source evidence, recovery/tombstones, migration without provider calls,")
-        print("CLI/HTTP wiring, offline preparation, OpenRouter validation, cache reuse, and safe errors.")
+        print("stored-vector similarity, grouped source evidence, vector-only recovery/tombstones, unchanged WAL migration/journal refusal,")
+        print("CLI/HTTP embedding deadlines, bounded partial bodies, offline preparation, validation, cache reuse, and safe errors.")
         print("Only loopback mock model APIs were used; no live GitHub, OpenRouter, or paid model calls.")
 
 
@@ -507,6 +522,15 @@ def check_validation(sandbox, env, cli, state, remote):
         assert_metadata_only(failed)
     env["AUTOMAIN_QDRANT_COLLECTION_PREFIX"] = prefix
     state["mode"] = "ok"
+    for mode in ("slow_headers", "slow_body"):
+        state["mode"] = mode
+        calls = len(state["requests"])
+        started = time.monotonic()
+        error = cli("search", "--query", "embedding deadline", "--timeout", "300ms", code=1)
+        assert_embedding_timeout(error)
+        assert time.monotonic() - started < 3, "embedding deadline did not bound CLI search"
+        assert len(state["requests"]) == calls + 1, "embedding timeout retried or bypassed the provider"
+    state["mode"] = "ok"
     incompatible_prefix = prefix + "_incompatible"
     collection = incompatible_prefix + remote.collection()[len(prefix):]
     remote.call("/collections/" + collection, {"vectors": {"size": 3072, "distance": "Dot"}}, "PUT")
@@ -548,6 +572,7 @@ def check_migration(sandbox, catalog, env, cli, state, remote):
     space = next(entry["space"] for entry in cli("index", "status")["spaces"] if entry["space"]["dimensions"] == 3072)
     space_id = hashlib.sha256(json.dumps(space, separators=(",", ":")).encode()).hexdigest()
     with sqlite3.connect(legacy) as db:
+        assert db.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
         db.create_function("vec_type", 1, lambda value: "float32", deterministic=True)
         db.create_function("vec_length", 1, lambda value: len(value) // 4, deterministic=True)
         db.executescript("""
@@ -576,20 +601,48 @@ def check_migration(sandbox, catalog, env, cli, state, remote):
             db.execute("INSERT INTO chunks VALUES(" + ",".join("?" for _ in values) + ")", values)
             vector = fixture_vector(f"title: {chunk['title']} | text: {chunk['text']}", 3072)
             db.execute("INSERT INTO embeddings VALUES(?,?,?,?,?)", (chunk["id"], space_id, chunk["content_hash"], 3072, struct.pack("<3072f", *vector)))
-    before = hashlib.sha256(legacy.read_bytes()).digest()
+    db.close()
+    assert legacy.read_bytes()[18:20] == b"\x02\x02", "fixture is not a WAL-mode SQLite database"
+    assert not Path(str(legacy) + "-wal").exists() and not Path(str(legacy) + "-shm").exists()
+    before = legacy_files(legacy)
     migrated = sandbox / "migrated-index.db"
     prefix = env["AUTOMAIN_QDRANT_COLLECTION_PREFIX"]
     env["AUTOMAIN_QDRANT_COLLECTION_PREFIX"] = prefix + "_migration"
     calls = len(state["requests"])
     del env["OPENROUTER_API_KEY"]
+    journal = Path(str(legacy) + "-journal")
+    with journal.open("xb"):
+        pass
+    try:
+        journal_before = legacy_files(legacy)
+        error = cli("index", "migrate", "--from", str(legacy), "--index-db", str(migrated), code=1)
+        assert error["code"] == "external_unavailable" and error["operation"] == "vector.legacy.open", error
+        assert "rollback journal" in error["message"].lower(), error
+        recovery = error.get("recovery", "").lower()
+        assert "copy" in recovery and "backup" in recovery and "never delete" in recovery and "journal" in recovery, error
+        assert len(state["requests"]) == calls, "rollback-journal refusal called an embedding provider"
+        assert legacy_files(legacy) == journal_before, "rollback-journal refusal changed source files or sidecar entries"
+    finally:
+        journal.unlink()
+    assert legacy_files(legacy) == before
     first = cli("index", "migrate", "--from", str(legacy), "--index-db", str(migrated), "--limit", "1")
     assert first["migrated_chunks"] == 1
+    assert legacy_files(legacy) == before, "successful migration changed legacy files or sidecar names"
     second = cli("index", "migrate", "--from", str(legacy), "--index-db", str(migrated), "--limit", "100")
     assert second["migrated_chunks"] == len(chunks) - 1
     repeated = cli("index", "migrate", "--from", str(legacy), "--index-db", str(migrated), "--limit", "100")
     assert repeated["migrated_chunks"] == 0
     assert len(state["requests"]) == calls
-    assert hashlib.sha256(legacy.read_bytes()).digest() == before, "migration modified legacy source"
+    assert legacy_files(legacy) == before, "migration modified legacy source or sidecars"
+    port = env["AUTOMAIN_QDRANT_PORT"]
+    try:
+        env["AUTOMAIN_QDRANT_PORT"] = "1"
+        error = cli("index", "migrate", "--from", str(legacy), "--index-db", str(migrated),
+                    "--timeout", "2s", code=1)
+        assert error["code"] == "external_unavailable", error
+        assert legacy_files(legacy) == before, "failed migration changed legacy files or sidecar names"
+    finally:
+        env["AUTOMAIN_QDRANT_PORT"] = port
     migrated_remote = Remote(remote.rest, env["AUTOMAIN_QDRANT_COLLECTION_PREFIX"])
     points = {point["id"]: point for point in migrated_remote.points()}
     assert set(points) == {point_id(chunk) for chunk in chunks}
@@ -600,6 +653,27 @@ def check_migration(sandbox, catalog, env, cli, state, remote):
         assert points[point_id(chunk)]["payload"]["content_hash"] == chunk["content_hash"]
     assert cli("index", "status", "--index-db", str(migrated))["spaces"][0]["embedded_chunks"] == len(chunks)
     assert_metadata_only(migrated)
+    env["OPENROUTER_API_KEY"] = PROVIDER_KEY
+    assert len(cli("search", "--query", "cache", "--index-db", str(migrated))["matches"]) == len(chunks)
+    # Delete only the unnamed dense vector, leaving the point and its payload.
+    # A payload receipt is not proof that a searchable vector still exists.
+    collection = migrated_remote.collection()
+    lost_id = point_id(chunks[0])
+    migrated_remote.call(f"/collections/{collection}/points/vectors/delete?wait=true",
+                         {"points": [lost_id], "vector": [""]})
+    damaged = next(point for point in migrated_remote.points() if point["id"] == lost_id)
+    assert damaged["payload"] == points[lost_id]["payload"] and not damaged.get("vector"), damaged
+    calls = len(state["requests"])
+    del env["OPENROUTER_API_KEY"]
+    cli("index", "reconcile", "--index-db", str(migrated))
+    entry = cli("index", "status", "--index-db", str(migrated))["spaces"][0]
+    assert entry["embedded_chunks"] == len(chunks) - 1 and entry["pending_chunks"] == 1, entry
+    restored = cli("index", "migrate", "--from", str(legacy), "--index-db", str(migrated), "--limit", "100")
+    assert restored["migrated_chunks"] == 1 and restored["reused_chunks"] == len(chunks) - 1, restored
+    assert len(state["requests"]) == calls, "vector-only recovery regenerated paid embeddings"
+    assert legacy_files(legacy) == before, "vector-only recovery changed legacy input"
+    repaired = next(point for point in migrated_remote.points() if point["id"] == lost_id)
+    assert len(repaired["vector"]) == 3072 and repaired["payload"] == damaged["payload"]
     env["OPENROUTER_API_KEY"] = PROVIDER_KEY
     assert len(cli("search", "--query", "cache", "--index-db", str(migrated))["matches"]) == len(chunks)
     # A healthy server with a dropped collection must not turn stale indexed
@@ -643,7 +717,7 @@ def check_migration(sandbox, catalog, env, cli, state, remote):
     restored = cli("index", "migrate", "--from", str(legacy), "--index-db", str(migrated), "--limit", "100")
     assert restored["migrated_chunks"] == len(chunks)
     assert len(state["requests"]) == calls, "empty-collection recovery regenerated paid embeddings"
-    assert hashlib.sha256(legacy.read_bytes()).digest() == before
+    assert legacy_files(legacy) == before
     env["OPENROUTER_API_KEY"] = PROVIDER_KEY
     assert len(cli("search", "--query", "cache", "--index-db", str(migrated))["matches"]) == len(chunks)
 
@@ -660,8 +734,22 @@ def check_migration(sandbox, catalog, env, cli, state, remote):
     env["AUTOMAIN_QDRANT_COLLECTION_PREFIX"] = prefix
 
 
+def legacy_files(path):
+    return {file.name: hashlib.sha256(file.read_bytes()).hexdigest()
+            for file in path.parent.glob(path.name + "*") if file.is_file()}
+
+
+def assert_embedding_timeout(error):
+    assert error["code"] == "external_unavailable" and error["operation"] == "embedding", error
+    message = error["message"].lower()
+    assert "openrouter" in message and "embedding" in message and "timed out" in message, error
+    recovery = error.get("recovery", "").lower()
+    assert "embedding" in recovery and "timeout" in recovery and "retry explicitly" in recovery, error
+    assert "no automatic retry" in recovery, error
+
+
 def check_http(binary, sandbox, env, state):
-    process = subprocess.Popen([str(binary), "serve", "--listen", "127.0.0.1:0"], cwd=sandbox,
+    process = subprocess.Popen([str(binary), "serve", "--listen", "127.0.0.1:0", "--timeout", "500ms"], cwd=sandbox,
                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         with selectors.DefaultSelector() as selector:
@@ -685,10 +773,41 @@ def check_http(binary, sandbox, env, state):
         assert migrated["ok"] and migrated["data"]["migrated_chunks"] == 0 and migrated["data"]["reused_chunks"] > 0
         request_json(url + "/api/index/migrate", {"repository": REPO, "path": str(sandbox / "absent.db"), "limit": 100}, status=400)
         assert len(state["requests"]) == calls, "similarity/readiness/reconcile/migrate called a model provider"
+        for path in ("/api/decide", "/api/index/prepare", "/api/analyze"):
+            check_partial_body(url, path)
+        assert len(state["requests"]) == calls, "partial HTTP bodies reached the embedding provider"
+        for mode in ("slow_headers", "slow_body"):
+            state["mode"] = mode
+            calls = len(state["requests"])
+            started = time.monotonic()
+            result = request_json(url + "/api/search", {"repository": REPO, "query": "embedding deadline"}, status=502)
+            assert_embedding_timeout(result["error"])
+            assert time.monotonic() - started < 2, "embedding deadline did not bound HTTP search"
+            assert len(state["requests"]) == calls + 1, "HTTP embedding timeout retried or bypassed the provider"
+        state["mode"] = "ok"
+        assert request_json(url + "/api/search", {"repository": REPO, "query": "recovered"})["ok"]
     finally:
         process.terminate()
         stdout, stderr = process.communicate(timeout=15)
         assert process.returncode == 0, (stdout, stderr)
+
+
+def check_partial_body(url, path):
+    address = urllib.parse.urlsplit(url)
+    with socket.create_connection((address.hostname, address.port), timeout=2) as connection:
+        connection.settimeout(2)
+        started = time.monotonic()
+        connection.sendall((f"POST {path} HTTP/1.1\r\nHost: {address.netloc}\r\n"
+                            "Content-Type: application/json\r\nContent-Length: 1000\r\n"
+                            "Connection: close\r\n\r\n{").encode())
+        # Keep the write side open. EOF would only exercise malformed JSON.
+        response = http.client.HTTPResponse(connection)
+        response.begin()
+        with response:
+            body = json.loads(response.read())
+            assert response.status == 502, (path, response.status, body)
+            assert not body["ok"] and body["error"]["code"] == "external_unavailable", body
+        assert time.monotonic() - started < 2, (path, "partial body outlived the request deadline")
 
 
 if __name__ == "__main__":

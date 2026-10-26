@@ -51,10 +51,13 @@ credit, model availability, rate limits, or invalid requests. Provider error bod
 are not echoed because they can contain source text or credentials. Missing keys
 return `not_configured`; invalid local settings/inputs return `invalid_input`.
 
-**Known defect (R6):** if the operation context expires during an embedding call,
-the adapter can return `internal_error` (HTTP 500) rather than `external_unavailable`.
-This misclassifies an upstream timeout and supplies an unhelpful recovery hint.
-See the [review follow-up](../../QDRANT_IMPLEMENTATION_PLAN.md#review-follow-up).
+Cancellation and timeouts return `external_unavailable` with operation `embedding`
+and an explicit recovery action. This includes expired contexts before submission,
+HTTP client timeouts even while the caller context remains active, and response-body
+read timeouts. An already canceled context makes no provider request. Wrapped errors
+preserve cancellation/deadline causes for `errors.Is`; messages do not expose endpoint
+URLs, credentials, or provider payloads. Retry only explicitly with an active context
+and a suitable timeout.
 
 Re-running indexing reuses already saved batches. A provider may still charge for
 a request that completed remotely but failed locally before its vectors were

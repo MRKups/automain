@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/url"
 	"os"
@@ -21,14 +22,15 @@ import (
 )
 
 type legacyIndex struct {
-	db *sql.DB
+	db          *sql.DB
+	snapshotDir string
 }
 
 var _ domain.LegacyIndex = (*legacyIndex)(nil)
 
-// OpenLegacy opens an existing schema-v1 index without changing its database or
-// WAL sidecars. The caller owns Close. Each read uses one SQLite snapshot, but
-// snapshots do not span calls; stop the old writer before starting migration.
+// OpenLegacy copies an existing schema-v1 index and its WAL/SHM without changing
+// the originals. Stop the old writer before copying. The caller owns Close,
+// which releases the private snapshot used by all reads.
 func OpenLegacy(ctx context.Context, path string) (_ domain.LegacyIndex, retErr error) {
 	defer func() { retErr = operational("vector.legacy.open", retErr) }()
 	if err := ctx.Err(); err != nil {
@@ -51,11 +53,54 @@ func OpenLegacy(ctx context.Context, path string) (_ domain.LegacyIndex, retErr 
 	if !info.Mode().IsRegular() || info.Size() == 0 {
 		return nil, invalid("legacy index path must name a nonempty regular file")
 	}
-	u := url.URL{Scheme: "file", Path: abs}
-	// mode=ro alone can still create or write the shared-memory sidecar.
-	// Require read-only shared memory instead; fail if SQLite needs a sidecar write.
+	// SQLite locates sidecars beside the resolved database, not a symlink alias.
+	abs, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return nil, fmt.Errorf("resolve legacy index file; check source path permissions: %w", err)
+	}
+	// Omitting a hot rollback journal can expose spilled, uncommitted pages as
+	// committed data. Do not infer whether a journal is hot or recover originals.
+	if _, err := os.Lstat(abs + "-journal"); err == nil {
+		return nil, domain.NewError(domain.ErrorCodeExternalUnavailable, "vector.legacy.open",
+			"Legacy index has a rollback journal; committed state cannot be read safely.",
+			"Preserve the original files. Recover a complete disposable copy with SQLite, or use a consistent backup; never delete the original journal to force migration.", nil)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect legacy rollback journal; check source read permissions: %w", err)
+	}
+	tempRoot, err := filepath.Abs(os.TempDir())
+	if err != nil {
+		return nil, fmt.Errorf("resolve temporary directory for legacy snapshot; choose an accessible temporary directory: %w", err)
+	}
+	snapshotDir, err := os.MkdirTemp(tempRoot, "automain-legacy-")
+	if err != nil {
+		return nil, fmt.Errorf("create private legacy snapshot; check temporary-directory permissions and free disk space: %w", err)
+	}
+	defer func() {
+		if retErr != nil {
+			if err := os.RemoveAll(snapshotDir); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("remove rejected legacy snapshot %q; remove this private directory after closing the reader: %w", snapshotDir, err))
+			}
+		}
+	}()
+	snapshotPath := filepath.Join(snapshotDir, "vectors.db")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if suffix != "" {
+			if _, err := os.Lstat(abs + suffix); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return nil, fmt.Errorf("inspect legacy sidecar %q; check source read permissions: %w", abs+suffix, err)
+			}
+		}
+		if err := copyLegacyFile(ctx, abs+suffix, snapshotPath+suffix); err != nil {
+			return nil, err
+		}
+	}
+	u := url.URL{Scheme: "file", Path: snapshotPath}
+	// Even mode=ro may create WAL/SHM files. Only this disposable copy is ever
+	// opened by SQLite, with SHM creation allowed so committed WAL stays readable.
 	u.RawQuery = url.Values{
-		"mode": {"ro"}, "readonly_shm": {"1"},
+		"mode":    {"ro"},
 		"_pragma": {"busy_timeout(5000)", "query_only(1)", "temp_store(MEMORY)"},
 	}.Encode()
 	db, err := sql.Open("sqlite", u.String())
@@ -71,7 +116,7 @@ func OpenLegacy(ctx context.Context, path string) (_ domain.LegacyIndex, retErr 
 	}()
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &legacyIndex{db: db}
+	s := &legacyIndex{db: db, snapshotDir: snapshotDir}
 	if err := s.snapshot(ctx, func(tx *sql.Tx) error {
 		return validateSchema(ctx, tx)
 	}); err != nil {
@@ -81,10 +126,74 @@ func OpenLegacy(ctx context.Context, path string) (_ domain.LegacyIndex, retErr 
 }
 
 func (s *legacyIndex) Close() error {
+	var retErr error
 	if err := s.db.Close(); err != nil {
-		return operational("vector.legacy.close", fmt.Errorf("close legacy vector index: %w", err))
+		retErr = fmt.Errorf("close legacy vector index: %w", err)
 	}
-	return nil
+	if err := os.RemoveAll(s.snapshotDir); err != nil {
+		retErr = errors.Join(retErr, fmt.Errorf("remove legacy snapshot %q; remove this private directory after closing the reader: %w", s.snapshotDir, err))
+	}
+	return operational("vector.legacy.close", retErr)
+}
+
+func copyLegacyFile(ctx context.Context, source, target string) (retErr error) {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("copy legacy snapshot: %w", err)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		return fmt.Errorf("inspect legacy snapshot input %q; check source read permissions: %w", source, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("legacy snapshot input %q is not a regular file; preserve the source and inspect its file type", source)
+	}
+	in, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("read legacy snapshot input %q; check source read permissions: %w", source, err)
+	}
+	defer func() {
+		if err := in.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close legacy snapshot input %q: %w", source, err))
+		}
+	}()
+	info, err = in.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect legacy snapshot input %q: %w", source, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("legacy snapshot input %q is not a regular file; preserve the source and inspect its file type", source)
+	}
+	out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("create legacy snapshot file; check temporary-directory permissions and free disk space: %w", err)
+	}
+	defer func() {
+		if err := out.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close legacy snapshot output; check temporary storage for I/O errors: %w", err))
+		}
+	}()
+	buf := make([]byte, 128*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("copy legacy snapshot: %w", err)
+		}
+		n, readErr := in.Read(buf)
+		if n > 0 {
+			written, err := out.Write(buf[:n])
+			if err != nil {
+				return fmt.Errorf("write legacy snapshot; check temporary-directory permissions and free disk space: %w", err)
+			}
+			if written != n {
+				return fmt.Errorf("write legacy snapshot; check free disk space: %w", io.ErrShortWrite)
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("read legacy snapshot input %q; preserve the source and check file integrity: %w", source, readErr)
+		}
+	}
 }
 
 func (s *legacyIndex) snapshot(ctx context.Context, read func(*sql.Tx) error) (retErr error) {
@@ -400,5 +509,5 @@ func operational(operation string, err error) error {
 	}
 	return domain.NewError(domain.ErrorCodeExternalUnavailable, operation,
 		fmt.Sprintf("Legacy index operation failed without changing its files: %v", err),
-		"Check read permissions and file integrity. Preserve readable WAL and SHM sidecars, or use a consistent SQLite backup; never remove the WAL to force migration.", err)
+		"Check source read permissions, file integrity, and temporary-directory permissions/free disk space. Preserve existing WAL and SHM sidecars, or use a consistent SQLite backup; never remove the original WAL to force migration.", err)
 }

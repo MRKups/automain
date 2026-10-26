@@ -17,9 +17,8 @@ not rebuild the Svelte UI. Use `task web` followed by `task build` for UI change
 [`check-guard.sh`](check-guard.sh) enforces repository-specific rules: no staged
 ignored docs/agent instruction files, no permanent `*_test.go` files, no Go
 `unsafe`, `panic`, or linter-suppression escape hatches, and no em/en dashes in
-checked source/prose. Restored local contracts in the ignored `/docs/` directory
-and focused guides beside code are linked through the
-[documentation index](../docs/README.md); ignored documentation must not be staged.
+checked source/prose. See the [backend guides](../internal/README.md) for subsystem
+contracts. Ignored documentation must not be staged.
 
 ## Retrieval checks with disposable Qdrant
 
@@ -45,10 +44,18 @@ Coverage includes metadata-only catalog ownership, UTF-8 passage offsets, offlin
 preparation, exact Qdrant/cosine parity, repository and dimension isolation,
 bounded indexing and unchanged cache reuse, stored-passage/item similarity without
 provider keys, grouped source evidence, source freshness, remote point loss and
-restoration, dropped-collection errors and restoration, tombstone cleanup, and
-resumable schema-v1 migration without embedding calls. CLI/HTTP wiring and
-health/readiness endpoints are exercised. Strict
-OpenRouter checks retain response reordering, malformed vector/model responses,
+restoration, dense-vector-only loss with preserved payloads, dropped-collection
+errors and restoration, tombstone cleanup, and resumable schema-v1 migration
+without embedding calls. A cleanly closed WAL-mode legacy input has its main-file
+hash and sidecar names/hashes checked after successful and failed migration.
+A synthetic rollback-journal sidecar must reject migration with recovery guidance,
+unchanged source files, and no embedding calls. This checks the refusal guard,
+not crash recovery of a real hot journal.
+CLI/HTTP wiring, health/readiness endpoints, delayed embedding response headers
+and bodies, and stalled decision/prepare/analyze request bodies are exercised.
+Provider deadlines must retain the `embedding` operation, adapter timeout
+diagnostics, and `external_unavailable` (HTTP 502), without retries.
+Strict OpenRouter checks retain response reordering, malformed vector/model responses,
 oversized inputs, safe errors, and no automatic retries/redirects. Both env
 examples are loaded through the real dotenv loader.
 
@@ -69,8 +76,9 @@ GOFLAGS=-race task check:decisions
 loopback mock Decisions API with disposable databases and synthetic keys. It
 checks all three primitives, structured inputs, numeric presence/ranges,
 distributions/legends, returned model identity, usage/cost, credential precedence,
-CLI and HTTP routes, invalid inputs/configuration, provider errors, timeouts,
-size/depth limits, no retries/redirects, and absence of source/catalog writes.
+CLI and HTTP routes, invalid inputs/configuration, provider errors, CLI/HTTP
+provider timeouts, stalled decision bodies, size/depth limits, no retries/redirects,
+and absence of source/catalog writes.
 Qdrant is deliberately unavailable during this check; no Docker daemon or
 Qdrant credentials are required. Liveness succeeds while readiness reports the
 missing dependency. The retrieval check also loads both env templates to verify
