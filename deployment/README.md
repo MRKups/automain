@@ -46,15 +46,18 @@ and `task compose:down`.
 ## Legacy analysis configuration
 
 Compose explicitly forwards `AUTOMAIN_LLM_PROVIDER` and the `API_KEY`, `MODEL`,
-`API_URL`, and `BASE_URL` settings under each prefix: `AUTOMAIN_LLM_`, `GEMINI_`,
-`OPENAI_`, and `DEEPSEEK_`. Unset key, model, and endpoint overrides remain blank,
+`API_URL`, and `BASE_URL` settings under each prefix: `AUTOMAIN_LLM_`, `OPENROUTER_`,
+`GEMINI_`, `OPENAI_`, and `DEEPSEEK_`. Compose falls back to OpenRouter only when
+`AUTOMAIN_LLM_PROVIDER` is unset or blank; the copied `.env.example` selects DeepSeek.
+Unset key, model, and endpoint overrides remain blank,
 so Go applies the same provider defaults, aliases, and fallback order as on the
 host. Generic endpoint overrides preserve private gateway URLs. See
 [legacy analysis configuration](../internal/config/README.md#legacy-relationship-analysis)
 for precedence; embedding and Jev settings remain separate.
 
-When switching providers from `.env.example`, clear or replace its explicit
-`AUTOMAIN_LLM_MODEL=gemini-2.5-flash` to avoid overriding the new provider's model.
+Generic `AUTOMAIN_LLM_MODEL` and endpoint overrides apply to every chat provider.
+Clear or replace them when switching providers; provider-specific settings do not
+override them. The env templates leave generic overrides blank.
 
 ## State and mutation ownership
 

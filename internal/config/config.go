@@ -15,11 +15,13 @@ import (
 
 const (
 	DefaultDBPath              = "./data/automain.db"
-	DefaultLLMProvider         = "gemini"
-	DefaultLLMModel            = "gemini-2.5-flash"
+	DefaultLLMProvider         = "openrouter"
+	DefaultLLMModel            = "google/gemini-2.5-flash"
+	DefaultGeminiModel         = "gemini-2.5-flash"
 	DefaultOpenAIModel         = "gpt-4o-mini"
 	DefaultDeepSeekModel       = "deepseek-chat"
 	DefaultGeminiBaseURL       = "https://generativelanguage.googleapis.com/v1beta"
+	DefaultOpenRouterBaseURL   = "https://openrouter.ai/api/v1"
 	DefaultOpenAIBaseURL       = "https://api.openai.com/v1"
 	DefaultDeepSeekBaseURL     = "https://api.deepseek.com"
 	DefaultFinder              = "llm"
@@ -61,13 +63,14 @@ type Config struct {
 	JSONOutput             bool
 }
 
-// NormalizeLLMProvider normalizes provider aliases to canonical names ("gemini", "openai", "deepseek").
+// NormalizeLLMProvider resolves the default provider and direct-provider aliases.
 func NormalizeLLMProvider(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", "gemini", "google":
-		if strings.TrimSpace(raw) == "" {
-			return DefaultLLMProvider
-		}
+	case "":
+		return DefaultLLMProvider
+	case "openrouter":
+		return "openrouter"
+	case "gemini", "google":
 		return "gemini"
 	case "openai", "openai-compatible":
 		return "openai"
@@ -157,6 +160,22 @@ func resolveLLMProviderSettings(provider string) (apiKey, model, baseURL string)
 	baseURL = firstNonEmptyEnv("AUTOMAIN_LLM_API_URL", "AUTOMAIN_LLM_BASE_URL")
 
 	switch provider {
+	case "openrouter":
+		if apiKey == "" {
+			apiKey = firstNonEmptyEnv("OPENROUTER_API_KEY")
+		}
+		if model == "" {
+			model = firstNonEmptyEnv("OPENROUTER_MODEL")
+		}
+		if model == "" {
+			model = DefaultLLMModel
+		}
+		if baseURL == "" {
+			baseURL = firstNonEmptyEnv("OPENROUTER_API_URL", "OPENROUTER_BASE_URL")
+		}
+		if baseURL == "" {
+			baseURL = DefaultOpenRouterBaseURL
+		}
 	case "openai":
 		if apiKey == "" {
 			apiKey = firstNonEmptyEnv("OPENAI_API_KEY", "DEEPSEEK_API_KEY")
@@ -197,7 +216,7 @@ func resolveLLMProviderSettings(provider string) (apiKey, model, baseURL string)
 			model = firstNonEmptyEnv("GEMINI_MODEL")
 		}
 		if model == "" {
-			model = DefaultLLMModel
+			model = DefaultGeminiModel
 		}
 		if baseURL == "" {
 			baseURL = firstNonEmptyEnv("GEMINI_API_URL", "GEMINI_BASE_URL")
@@ -291,13 +310,13 @@ func (c Config) Validate(operation string) error {
 		}
 	}
 	switch NormalizeLLMProvider(c.LLMProvider) {
-	case "gemini", "openai", "deepseek":
+	case "openrouter", "gemini", "openai", "deepseek":
 	default:
 		return domain.NewError(
 			domain.ErrorCodeInvalidInput,
 			operation,
 			fmt.Sprintf("Unsupported LLM provider %q.", c.LLMProvider),
-			"Set AUTOMAIN_LLM_PROVIDER to gemini, openai, or deepseek.",
+			"Set AUTOMAIN_LLM_PROVIDER to openrouter, gemini, openai, or deepseek.",
 			nil,
 		)
 	}

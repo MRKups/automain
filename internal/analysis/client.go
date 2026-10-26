@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	DefaultBaseURL       = config.DefaultGeminiBaseURL
+	DefaultBaseURL       = config.DefaultOpenRouterBaseURL
 	DefaultModel         = config.DefaultLLMModel
 	DefaultUserAgent     = "automain/0.1.0-dev"
 	defaultHTTPTimeout   = 60 * time.Second
@@ -62,6 +62,11 @@ func NewClient(cfg config.Config) *Client {
 	}
 	if baseURL == "" {
 		switch provider {
+		case "openrouter":
+			baseURL = strings.TrimSpace(os.Getenv("OPENROUTER_API_URL"))
+			if baseURL == "" {
+				baseURL = strings.TrimSpace(os.Getenv("OPENROUTER_BASE_URL"))
+			}
 		case "openai":
 			baseURL = strings.TrimSpace(os.Getenv("OPENAI_API_URL"))
 			if baseURL == "" {
@@ -93,6 +98,8 @@ func NewClientWithConfig(cfg ClientConfig) *Client {
 	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 	if baseURL == "" {
 		switch provider {
+		case "gemini":
+			baseURL = config.DefaultGeminiBaseURL
 		case "openai":
 			baseURL = config.DefaultOpenAIBaseURL
 		case "deepseek":
@@ -109,6 +116,8 @@ func NewClientWithConfig(cfg ClientConfig) *Client {
 	model := rawModel
 	if model == "" {
 		switch provider {
+		case "gemini":
+			model = config.DefaultGeminiModel
 		case "openai":
 			model = config.DefaultOpenAIModel
 		case "deepseek":
@@ -163,7 +172,7 @@ func (c *Client) ValidateConfig() error {
 			domain.ErrorCodeNotConfigured,
 			"analyze",
 			fmt.Sprintf("LLM API key is not configured for provider %q.", c.provider),
-			"Set AUTOMAIN_LLM_API_KEY (or GEMINI_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY) in .env or the environment before running 'automain analyze'.",
+			"Set AUTOMAIN_LLM_API_KEY or the selected provider's key: OPENROUTER_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY.",
 			nil,
 		)
 	}
@@ -171,7 +180,7 @@ func (c *Client) ValidateConfig() error {
 }
 
 func (c *Client) isOpenAICompatible() bool {
-	if c.provider == "openai" || c.provider == "deepseek" {
+	if c.provider == "openrouter" || c.provider == "openai" || c.provider == "deepseek" {
 		return true
 	}
 	lowerURL := strings.ToLower(c.baseURL)
@@ -467,7 +476,7 @@ func mapLLMStatusAndDetail(statusCode int, detail string) error {
 			domain.ErrorCodeExternalUnavailable,
 			"analyze",
 			msg,
-			"Verify that AUTOMAIN_LLM_API_KEY (or GEMINI_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY) is valid.",
+			"Check AUTOMAIN_LLM_API_KEY or the selected provider's key and permissions.",
 			nil,
 		)
 	case http.StatusTooManyRequests:

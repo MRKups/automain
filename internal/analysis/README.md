@@ -7,6 +7,12 @@ asks an LLM for relationship decisions, normalizes the response, and saves threa
 relationships, and evidence in the source database. It does not consume the new
 Gemini embedding index.
 
+Without overrides, chat uses `AUTOMAIN_LLM_PROVIDER=openrouter`,
+`OPENROUTER_API_KEY`, and model `google/gemini-2.5-flash`. Direct `gemini`,
+`openai`, and official `deepseek` access remain available. See
+[provider configuration](../config/README.md#legacy-relationship-analysis) for
+key, model, and endpoint overrides. This selection does not change embeddings or Jev.
+
 ```sh
 automain analyze --repo owner/name --limit 10 --finder fts --json
 automain analyze --repo owner/name --item 42 --reanalyze --json

@@ -97,8 +97,18 @@ the separation between this plumbing and later relationship policy.
 ## Legacy relationship analysis
 
 This configuration affects legacy `analyze`, not semantic search or Jev decisions.
-`AUTOMAIN_LLM_PROVIDER` accepts `gemini` (default), `openai`, or `deepseek`.
+`AUTOMAIN_LLM_PROVIDER` accepts `openrouter`, `gemini`, `openai`, or `deepseek`.
+When unset, it defaults to `openrouter`.
 `google` aliases Gemini; `openai-compatible` aliases OpenAI.
+
+`.env.example` explicitly selects DeepSeek; `env.example` selects OpenRouter.
+Their provider-specific model values override the built-in
+fallbacks below. Model IDs are configurable; offline checks do not establish their
+availability with a live provider.
+
+OpenRouter chat uses the OpenAI-compatible API with model IDs such as
+`google/gemini-2.5-flash`. Direct Gemini, OpenAI, and DeepSeek remain separate
+provider choices; selecting `deepseek` uses the official DeepSeek API, not OpenRouter.
 
 Common overrides take precedence over provider variables:
 
@@ -108,14 +118,17 @@ Common overrides take precedence over provider variables:
 
 Without those overrides, the first non-empty value is used:
 
-| Provider | Key fallback order | Model fallback order | Default model |
+| Provider | Key fallback order | Model fallback order | Built-in model fallback |
 | --- | --- | --- | --- |
+| OpenRouter | `OPENROUTER_API_KEY` | `OPENROUTER_MODEL` | `google/gemini-2.5-flash` |
 | Gemini | `GEMINI_API_KEY` | `GEMINI_MODEL` | `gemini-2.5-flash` |
 | OpenAI | `OPENAI_API_KEY`, `DEEPSEEK_API_KEY` | `OPENAI_MODEL` | `gpt-4o-mini` |
 | DeepSeek | `DEEPSEEK_API_KEY`, `OPENAI_API_KEY` | `DEEPSEEK_MODEL`, `OPENAI_MODEL` | `deepseek-chat` |
 
 Provider URL variables are tried in this order:
 
+- OpenRouter: `OPENROUTER_API_URL`, `OPENROUTER_BASE_URL`; default
+  `https://openrouter.ai/api/v1`.
 - Gemini: `GEMINI_API_URL`, `GEMINI_BASE_URL`; default
   `https://generativelanguage.googleapis.com/v1beta`.
 - OpenAI: `OPENAI_API_URL`, `OPENAI_BASE_URL`; default `https://api.openai.com/v1`.
@@ -124,6 +137,13 @@ Provider URL variables are tried in this order:
 
 The cross-provider key fallbacks are existing behavior, not model fallback.
 Check the resolved provider/model/URL in `status` before running analysis.
+
+`OPENROUTER_API_KEY` can supply chat, embeddings, and decisions. Dedicated keys
+override it independently. `OPENROUTER_MODEL` and `OPENROUTER_BASE_URL` affect chat
+only, not embedding or decision settings. Without a chat key, non-LLM operations
+still work. Existing `.env` files that explicitly select a provider keep that choice;
+remove or change `AUTOMAIN_LLM_PROVIDER=gemini` to use the new default. Clear generic
+model/endpoint overrides when switching providers unless they match the new provider.
 
 ## Secrets and validation
 
