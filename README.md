@@ -1,88 +1,101 @@
 # Automain
 
-Automain imports GitHub issues, pull requests, and discussions, finds unlinked
-relationships across repository activity, and groups related items into
-persistent threads backed by source evidence.
+Automain imports GitHub issues, pull requests, discussions, and comments so you
+can search related activity and inspect persistent threads and relationships.
+The Go application includes a CLI, HTTP API, and embedded Svelte UI. SQLite owns
+source records and relationships; Qdrant 1.20.0 supplies semantic retrieval.
 
-## Status
+## Current state
 
-Core domain contracts (`internal/domain`), runtime configuration
-(`internal/config`), SQLite persistence (`internal/storage/sqlite`), GitHub
-ingestion (`internal/github`), candidate discovery (`llm`, `fts`, and `vector`)
-and relationship analysis (`internal/analysis`), application service facade
-(`internal/app`), HTTP API server (`internal/server`), embedded Svelte UI
-(`web`), and the `automain` CLI (`cmd/automain`, `internal/cli`) for `status`,
-`version`, `sync`, `items`, `analyze`, `threads`, `relationships`, `stats`,
-`graph`, `repositories`, and `serve` are implemented.
+- GitHub import and thread/relationship inspection are available through CLI,
+  API, and UI. [Import coverage](docs/ingestion.md#coverage-limits) is limited.
+- Text search uses Gemini embeddings through OpenRouter. `similar` reuses stored
+  vectors without model calls. Both return source passages, not relationship verdicts.
+- Canonical `automain.db`, metadata-only `index.db`, Qdrant storage, explicit
+  legacy-vector migration, and two-service Compose deployment are implemented and
+  verified with disposable fixtures, real Qdrant, and Compose. The
+  [implementation plan](QDRANT_IMPLEMENTATION_PLAN.md) owns acceptance evidence.
+- `decide` asks Jev explicit typed questions without writes. Automatic relationship
+  policy remains open. `analyze` is a separate legacy LLM pipeline whose `vector`
+  finder means TF-IDF. See [analysis limits](internal/analysis/README.md).
 
-## Stack
+The version is `0.1.0-dev`. Checks made no paid model calls and migrated no live
+data. They do not establish release readiness or semantic/relationship accuracy.
 
-- **Backend and CLI:** Go
-- **Storage:** SQLite
-- **Web UI:** Svelte (embedded into the Go binary)
+**Review found six open defects**, including WAL migration, missing-vector recovery,
+and Compose configuration parity. See the [review follow-up](QDRANT_IMPLEMENTATION_PLAN.md#review-follow-up)
+before migrating existing data or relying on recovery. Passing fixtures did not cover
+these cases; the defects have not yet been fixed.
 
-## Build and Run
+## Quick start
 
-Prerequisites: Go 1.24+, [Task](https://taskfile.dev), and Node.js 20+ (only when rebuilding `web/dist`).
+For the two-service stack, follow the [container guide](deployment/README.md).
+It requires a local Qdrant API key in `.env`; real keys are blank in the templates.
+The app has no authentication. Its default published address is loopback only.
+
+For a host build, install Go 1.26+ and [Task](https://taskfile.dev). Node.js 20+
+is needed when rebuilding the frontend. Run Qdrant 1.20.0 separately for vector
+operations and configure it using the [configuration guide](internal/config/README.md).
 
 ```sh
-# Copy env.example to .env and configure GITHUB_TOKEN / AUTOMAIN_LLM_API_KEY
-cp env.example .env
-
-# Rebuild embedded frontend assets (optional when editing web/src/*)
-task web
-
-# Build bin/automain
+test -f .env || cp .env.example .env
+# Edit .env: set OPENROUTER_API_KEY for embeddings and Jev decisions.
+# GITHUB_TOKEN is optional for public issues/PRs, required for Discussions.
 task build
 
-# Run static guard, formatting, vet, and compilation checks
-task check
+# Keep example data outside the development checkout.
+demo_dir=$(mktemp -d "${TMPDIR:-/tmp}/automain-demo.XXXXXX")
+export AUTOMAIN_DB_PATH="$demo_dir/automain.db"
+export AUTOMAIN_INDEX_DB_PATH="$demo_dir/index.db"
 
-# Run in a disposable /tmp sandbox
+./bin/automain status --json
+./bin/automain sync --repo owner/name --limit 100 --json
+./bin/automain index prepare --repo owner/name --json
+./bin/automain index embed --repo owner/name --limit 100 --timeout 5m --json
+./bin/automain index status --repo owner/name --json
+./bin/automain search --repo owner/name --query "cache entries stay stale" --json
+./bin/automain similar --repo owner/name --item 123 --json
+./bin/automain decide --input internal/decision/example.json --json
+./bin/automain serve --repo owner/name
+```
+
+Replace `owner/name` with your repository. `sync --limit` counts GitHub items;
+`index embed --limit` counts source passages. A single item can produce many
+passages. Repeat embedding runs to process remaining pending passages; completed,
+unchanged passages are reused. Choose an indexed item number for `similar`.
+`serve` defaults to `http://127.0.0.1:8080`.
+The example retains data in `$demo_dir` for this session; configure stable paths
+outside the checkout for continued use. Sync, embedding, search, and decisions can
+contact live providers and incur costs. Use the disposable fixture checks for verification.
+
+Status, sync, passage preparation, and standalone decisions do not contact Qdrant.
+Preparation needs no model key. Preserve any old `vectors.db` and use the explicit
+[migration workflow](internal/retrieval/README.md#legacy-vector-migration) to reuse
+compatible embeddings without paid regeneration. The old `--vector-db` setting
+does not select active vector storage.
+
+## Guides
+
+- [Documentation index](docs/README.md), [architecture](docs/architecture.md),
+  and [implementation map](internal/README.md).
+- [Retrieval and migration](internal/retrieval/README.md),
+  [storage/recovery](internal/storage/README.md), and
+  [configuration](internal/config/README.md).
+- [CLI](internal/cli/README.md), [HTTP API](internal/server/README.md),
+  [web UI](web/README.md), and [container deployment](deployment/README.md).
+
+## Development
+
+```sh
+task check                 # Guard, formatting, vet, and compilation
+task check:retrieval       # Retrieval fixtures; see scripts/README.md for prerequisites
+task check:decisions       # Offline Jev CLI/API fixtures; no live API calls
+task web                  # Rebuild frontend assets after editing web/src
+task build                # Embed assets into a rebuilt Go binary
 task sandbox -- status --json
 ```
 
-### CLI Commands
-
-```sh
-automain status [--db <path>] [--repo <owner/name>] [--json]
-automain version [--json]
-automain sync --repo <owner/name> [--limit <n>] [--since <RFC3339>] [--full] [--json]
-automain items [list|show] --repo <owner/name> [--kind <kind>] [--state <state>] [--dirty] [--number <n>] [--json]
-automain analyze --repo <owner/name> [--item <number>] [--limit <n>] [--reanalyze] [--finder llm|fts|vector] [--json]
-automain threads [list|show] [--repo <owner/name>] [--id <thread-id>] [--json]
-automain relationships [list|show|verify] [--repo <owner/name>] [--id <rel-id>] [--json]
-automain stats --repo <owner/name> [--json]
-automain graph --repo <owner/name> [--json]
-automain repositories [list] [--db <path>] [--json]
-automain serve [--listen <host:port>] [--db <path>] [--repo <owner/name>] [--json]
-```
-
-### HTTP API (`automain serve`)
-
-- `GET /` serves the embedded Svelte single-page application.
-- `GET /healthz`, `GET /api/health`, `GET /api/version`, `GET /api/status`
-- `GET /api/repositories`, `GET /api/stats?repo=<owner/name>`, `GET /api/graph?repo=<owner/name>`
-- `POST /api/sync` (`repository`, `limit`, `since`, `full`)
-- `POST /api/analyze` (`repository`, `item_number`, `limit`, `reanalyze`, `finder`)
-- `GET /api/items?repo=<owner/name>&kind=<kind>&state=<state>&dirty=<bool>&limit=<n>`
-- `GET /api/items/{number}?repo=<owner/name>`
-- `GET /api/threads?repo=<owner/name>&status=<active|resolved|stale>`
-- `GET /api/threads/show?id=<thread-id>`, `GET /api/threads/{id}`
-- `GET /api/relationships?repo=<owner/name>&type=<type>&verified=<bool>&thread=<id>&item=<n>`
-- `GET /api/relationships/show?id=<rel-id>`, `GET /api/relationships/{id}`
-- `POST /api/relationships/verify` (`id`, `verified`), `POST /api/relationships/{id}/verify`
-
-## Core Concepts
-
-- **Item:** A GitHub issue, pull request, or discussion, including its comments
-  and updates.
-- **Thread:** A persistent representation of a shared problem, request, or
-  decision containing one or more items. One item can belong to multiple
-  threads.
-- **Relationship:** A typed link between an item and a thread with a plain-text
-  explanation and references to source items or comments.
-- **Graph:** The network of threads, items, and relationships stored in SQLite.
+See [development checks](scripts/README.md) for isolated verification and limits.
 
 ## License
 

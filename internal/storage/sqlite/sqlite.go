@@ -85,6 +85,23 @@ func Open(ctx context.Context, dbPath string) (*Store, error) {
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 	db.SetConnMaxIdleTime(0)
+	// A vector index must never be opened as the authoritative source store.
+	// Source databases predate application IDs and currently use the default 0.
+	if err := execPragma(ctx, db, "PRAGMA busy_timeout = 5000;"); err != nil {
+		closeDB(db)
+		return nil, fmt.Errorf("configure source identity read: %w", err)
+	}
+	var applicationID int
+	if err := db.QueryRowContext(ctx, "PRAGMA application_id").Scan(&applicationID); err != nil {
+		closeDB(db)
+		return nil, fmt.Errorf("read source database identity: %w", err)
+	}
+	if applicationID != 0 {
+		closeDB(db)
+		return nil, domain.NewError(domain.ErrorCodeInvalidInput, "storage.open",
+			"Source database path points to a vector index or another application's database.",
+			"Use the original source file for --db and a separate file for --vector-db.", nil)
+	}
 
 	if err := applyPragmas(ctx, db); err != nil {
 		closeDB(db)

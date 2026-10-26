@@ -59,6 +59,36 @@ tasks:
       - task: lint
       - go build ./...
 
+  check:retrieval:
+    desc: Check retrieval and the OpenRouter adapter offline with disposable databases (requires Python 3)
+    cmds:
+      - python3 scripts/check-retrieval.py
+
+  check:decisions:
+    desc: Check Jev decision plumbing offline with a local mock API (requires Python 3)
+    cmds:
+      - python3 scripts/check-decisions.py
+
+  compose:build:
+    desc: Build the production image with embedded Svelte assets
+    cmds:
+      - docker compose build
+
+  compose:up:
+    desc: Build and start the app and private Qdrant, waiting for readiness
+    cmds:
+      - docker compose up --build --detach --wait --wait-timeout 180
+
+  compose:down:
+    desc: Stop the stack and preserve its data volumes
+    cmds:
+      - docker compose down
+
+  compose:logs:
+    desc: Follow app and Qdrant logs
+    cmds:
+      - docker compose logs --follow --tail 100
+
   dev:
     desc: Run automain with isolated persistent state in ~/.automain-dev
     cmds:
@@ -68,6 +98,7 @@ tasks:
           DEV_ROOT="$HOME/.automain-dev"
           mkdir -p "$DEV_ROOT"
           export AUTOMAIN_DB_PATH="$DEV_ROOT/automain.db"
+          export AUTOMAIN_INDEX_DB_PATH="$DEV_ROOT/index.db"
           exec go run ./cmd/automain "$@"
         ' automain-dev {{._AUTOMAIN_ARGS}}
 
@@ -80,5 +111,6 @@ tasks:
           SANDBOX_ROOT=$(mktemp -d /tmp/automain-sandbox.XXXXXX)
           trap "rm -rf \"\$SANDBOX_ROOT\"" 0 HUP INT TERM
           export AUTOMAIN_DB_PATH="$SANDBOX_ROOT/automain.db"
+          export AUTOMAIN_INDEX_DB_PATH="$SANDBOX_ROOT/index.db"
           go run ./cmd/automain "$@"
         ' automain-sandbox {{._AUTOMAIN_ARGS}}

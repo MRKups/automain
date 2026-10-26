@@ -1,0 +1,67 @@
+services:
+  automain:
+    build:
+      context: .
+    init: true
+    restart: unless-stopped
+    command: ["serve"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      AUTOMAIN_DB_PATH: /data/automain.db
+      AUTOMAIN_INDEX_DB_PATH: /data/index.db
+      AUTOMAIN_LISTEN_ADDR: 0.0.0.0:8080
+      AUTOMAIN_QDRANT_HOST: qdrant
+      AUTOMAIN_QDRANT_PORT: "6334"
+      AUTOMAIN_QDRANT_TLS: "false"
+      AUTOMAIN_QDRANT_COLLECTION_PREFIX: automain_
+      AUTOMAIN_QDRANT_API_KEY: ${AUTOMAIN_QDRANT_API_KEY:?Set AUTOMAIN_QDRANT_API_KEY in .env or the shell}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      AUTOMAIN_EMBEDDING_API_KEY: ${AUTOMAIN_EMBEDDING_API_KEY:-}
+      AUTOMAIN_EMBEDDING_MODEL: ${AUTOMAIN_EMBEDDING_MODEL:-google/gemini-embedding-2}
+      AUTOMAIN_EMBEDDING_DIMENSIONS: ${AUTOMAIN_EMBEDDING_DIMENSIONS:-3072}
+      AUTOMAIN_EMBEDDING_BASE_URL: ${AUTOMAIN_EMBEDDING_BASE_URL:-https://openrouter.ai/api/v1}
+      AUTOMAIN_DECISION_API_KEY: ${AUTOMAIN_DECISION_API_KEY:-}
+      AUTOMAIN_DECISION_MODEL: ${AUTOMAIN_DECISION_MODEL:-typesafe/jev-1.14}
+      AUTOMAIN_DECISION_ENDPOINT: ${AUTOMAIN_DECISION_ENDPOINT:-https://openrouter.ai/api/alpha/decisions}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      AUTOMAIN_REPO: ${AUTOMAIN_REPO:-}
+      AUTOMAIN_LLM_PROVIDER: ${AUTOMAIN_LLM_PROVIDER:-gemini}
+      AUTOMAIN_LLM_API_KEY: ${AUTOMAIN_LLM_API_KEY:-}
+      AUTOMAIN_LLM_MODEL: ${AUTOMAIN_LLM_MODEL:-gemini-2.5-flash}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      AUTOMAIN_FINDER: ${AUTOMAIN_FINDER:-llm}
+    volumes:
+      - automain-data:/data
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    stop_grace_period: 30s
+
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__API_KEY: ${AUTOMAIN_QDRANT_API_KEY:?Set AUTOMAIN_QDRANT_API_KEY in .env or the shell}
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -ec
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/6333;
+          printf 'GET /readyz HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3;
+          IFS= read -r status <&3;
+          [[ "$$status" == *' 200 '* ]]
+      interval: 5s
+      timeout: 5s
+      start_period: 15s
+      retries: 12
+    stop_grace_period: 30s
+
+volumes:
+  automain-data:
+  qdrant-data:

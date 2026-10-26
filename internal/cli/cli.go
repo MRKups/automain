@@ -39,7 +39,7 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 			domain.ErrorCodeInvalidInput,
 			"cli",
 			"Subcommand is required.",
-			"Run 'automain --help' to list supported commands: status, sync, items, analyze, threads, relationships, stats, graph, repositories, serve, version.",
+			"Run 'automain --help' to list supported commands: status, sync, items, index, search, similar, decide, analyze, threads, relationships, stats, graph, repositories, serve, version.",
 			nil,
 		))
 	}
@@ -93,6 +93,14 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 		return runItems(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "analyze":
 		return runAnalyze(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+	case "index":
+		return runIndex(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+	case "search":
+		return runSearch(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+	case "similar":
+		return runSimilar(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
+	case "decide":
+		return runDecide(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "threads":
 		return runThreads(cmdCtx, factory, globalCfg, subArgs, jsonRequested, helpRequested, stdout, stderr)
 	case "relationships":
@@ -110,7 +118,7 @@ func Execute(ctx context.Context, args []string, baseCfg config.Config, factory 
 			domain.ErrorCodeInvalidInput,
 			subcmd,
 			fmt.Sprintf("Unknown command %q.", subcmd),
-			"Run 'automain --help' to list supported commands: status, sync, items, analyze, threads, relationships, stats, graph, repositories, serve, version.",
+			"Run 'automain --help' to list supported commands, including index and search.",
 			nil,
 		))
 	}
@@ -160,7 +168,7 @@ func runSync(ctx context.Context, factory ServiceFactory, cfg config.Config, arg
 	fs := newSubFlagSet("sync")
 	limit := fs.Int("limit", 0, "Maximum number of items to fetch")
 	sinceStr := fs.String("since", "", "Fetch updates since RFC3339 timestamp")
-	full := fs.Bool("full", false, "Ignore stored sync watermark and perform full import")
+	full := fs.Bool("full", false, "Ignore --since and fetch without an update cutoff")
 	if err := parseSubcommandFlags(fs, "sync", args, "Run 'automain sync --help' to inspect valid flags."); err != nil {
 		return writeError(stdout, stderr, jsonMode, "sync", err)
 	}
@@ -1098,7 +1106,7 @@ func detectJSONFlag(args []string) bool {
 	return jsonMode
 }
 
-// extractGlobalFlags strips global options (--db, --repo, --json, --timeout, --finder, --listen, --help)
+// extractGlobalFlags strips global options (--db, --index-db, --vector-db, --repo, --json, --timeout, --finder, --listen, --help)
 // regardless of whether they appear before or after the subcommand name.
 func extractGlobalFlags(base config.Config, args []string) (config.Config, []string, bool, error) {
 	cfg := base
@@ -1142,6 +1150,32 @@ func extractGlobalFlags(base config.Config, args []string) (config.Config, []str
 				return cfg, nil, false, err
 			}
 			cfg.DBPath = val
+		case arg == "--index-db" || arg == "-index-db":
+			val, next, err := consumeValue("--index-db", args, i)
+			if err != nil {
+				return cfg, nil, false, err
+			}
+			cfg.IndexDBPath = val
+			i = next
+		case hasFlagValuePrefix(arg, "index-db"):
+			val, err := extractInlineValue("--index-db", arg)
+			if err != nil {
+				return cfg, nil, false, err
+			}
+			cfg.IndexDBPath = val
+		case arg == "--vector-db" || arg == "-vector-db":
+			val, next, err := consumeValue("--vector-db", args, i)
+			if err != nil {
+				return cfg, nil, false, err
+			}
+			cfg.VectorDBPath = val
+			i = next
+		case hasFlagValuePrefix(arg, "vector-db"):
+			val, err := extractInlineValue("--vector-db", arg)
+			if err != nil {
+				return cfg, nil, false, err
+			}
+			cfg.VectorDBPath = val
 		case arg == "--repo" || arg == "-repo":
 			val, next, err := consumeValue("--repo", args, i)
 			if err != nil {
@@ -1280,9 +1314,13 @@ Usage:
 
 Commands:
   status          Show configuration, database path, and wired adapter status
-  sync            Import and incrementally update items from a GitHub repository
+  sync            Import GitHub items and comments, optionally filtered by --since
   items           List repository items or inspect an item with comments (list|show)
-  analyze         Classify items, find candidate threads, and verify relationships
+  index           Manage the passage catalog and Qdrant index (prepare|status|embed|reconcile|migrate)
+  search          Retrieve similar source passages without deciding relationships
+  similar         Find related items using stored passage vectors; no model calls
+  decide          Ask Jev typed questions about supplied state (no relationship writes)
+  analyze         Use the legacy LLM pipeline to propose threads and relationships
   threads         List threads or inspect a thread and its member items (list|show)
   relationships   List, inspect, or verify item-to-thread relationships (list|show|verify)
   stats           Calculate repository activity and relationship graph statistics
@@ -1293,10 +1331,13 @@ Commands:
 
 Global Flags:
   --db <path>          SQLite database file path (env: AUTOMAIN_DB_PATH)
+  --index-db <path>    SQLite passage catalog (env: AUTOMAIN_INDEX_DB_PATH; default: index.db next to --db)
+  --vector-db <path>   Deprecated legacy read-only source path, never opened at startup; migrate requires --from
   --repo <owner/name>  Target GitHub repository (env: AUTOMAIN_REPO)
-  --finder <strategy>  Candidate discovery strategy: llm | fts | vector (env: AUTOMAIN_FINDER)
+  --finder <strategy>  Legacy analysis finder: llm | fts | vector (TF-IDF, not embeddings)
+                      Environment: AUTOMAIN_FINDER; does not affect search
   --listen <addr>      HTTP server listen address (env: AUTOMAIN_LISTEN_ADDR / PORT)
-  --timeout <duration> Per-command execution timeout (default: 60s)
+  --timeout <duration> Command / serve API request timeout (default: 60s)
   --json               Emit structured JSON output
   -h, --help           Show help for automain or a subcommand
 `)

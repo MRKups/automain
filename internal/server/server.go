@@ -162,13 +162,17 @@ func ListenAndServe(
 	}
 }
 
-// ServeHTTP routes API requests under /api/ and /healthz, and serves embedded static UI assets for all other paths.
+// ServeHTTP routes API and health requests, and serves embedded static UI assets for other paths.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	cleanPath := path.Clean("/" + strings.TrimSpace(r.URL.Path))
 	if cleanPath == "/healthz" {
 		s.handleHealth(w, r)
+		return
+	}
+	if cleanPath == "/readyz" {
+		s.handleReadiness(w, r)
 		return
 	}
 
@@ -210,6 +214,9 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, cleanPath stri
 	switch {
 	case subPath == "/health":
 		s.handleHealth(w, r)
+
+	case subPath == "/ready" || subPath == "/readyz":
+		s.handleReadiness(w, r)
 
 	case subPath == "/version":
 		if !requireMethod(w, r, "version", http.MethodGet, http.MethodHead) {
@@ -277,6 +284,18 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, cleanPath stri
 			return
 		}
 		s.handleAnalyze(w, r, reqCtx)
+
+	case subPath == "/index/status" || subPath == "/index/prepare" || subPath == "/index/embed" || subPath == "/index/reconcile" || subPath == "/search":
+		s.handleRetrieval(w, r, reqCtx, subPath)
+
+	case subPath == "/index/migrate":
+		s.handleMigrate(w, r, reqCtx)
+
+	case subPath == "/similar":
+		s.handleSimilar(w, r, reqCtx)
+
+	case subPath == "/decide":
+		s.handleDecide(w, r, reqCtx)
 
 	case subPath == "/items":
 		if !requireMethod(w, r, "items.list", http.MethodGet, http.MethodHead) {
@@ -394,6 +413,24 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":  "ok",
 		"version": app.Version,
 	})
+}
+
+func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, "readiness", http.MethodGet, http.MethodHead) {
+		return
+	}
+	if s.svc == nil {
+		writeAPIErrorWithStatus(w, http.StatusServiceUnavailable, "readiness", domain.NewError(
+			domain.ErrorCodeNotConfigured, "readiness", "Readiness check failed: application service is not initialized.", "Inspect server startup configuration and logs.", nil))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), min(s.timeout, 5*time.Second))
+	defer cancel()
+	if err := s.svc.Readiness(ctx); err != nil {
+		writeAPIErrorWithStatus(w, http.StatusServiceUnavailable, "readiness", domain.AsError("readiness", err))
+		return
+	}
+	writeAPISuccess(w, http.StatusOK, "readiness", map[string]string{"status": "ready"})
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request, ctx context.Context) {

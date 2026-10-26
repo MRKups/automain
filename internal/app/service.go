@@ -9,6 +9,7 @@ import (
 	"github.com/MRKups/automain/internal/analysis"
 	"github.com/MRKups/automain/internal/config"
 	"github.com/MRKups/automain/internal/domain"
+	"github.com/MRKups/automain/internal/retrieval"
 )
 
 const Version = "0.1.0-dev"
@@ -20,20 +21,41 @@ type Adapters struct {
 	Finder     domain.CandidateFinder
 	Analyser   domain.RelationshipAnalyser
 	EmbeddedUI bool
+	Catalog    domain.ChunkCatalog
+	Vectors    domain.VectorStore
+	Embedder   domain.EmbeddingProvider
+	Decider    domain.DecisionProvider
+	OpenLegacy domain.LegacyIndexOpener
 }
 
 // StatusConfig is a safe, secret-redacted projection of runtime configuration.
 type StatusConfig struct {
-	DBPath         string `json:"db_path"`
-	Repository     string `json:"repository,omitempty"`
-	Finder         string `json:"finder"`
-	ListenAddr     string `json:"listen_addr"`
-	Timeout        string `json:"timeout"`
-	GitHubTokenSet bool   `json:"github_token_set"`
-	LLMProvider    string `json:"llm_provider"`
-	LLMAPIKeySet   bool   `json:"llm_api_key_set"`
-	LLMModel       string `json:"llm_model"`
-	LLMBaseURL     string `json:"llm_base_url,omitempty"`
+	DBPath                 string `json:"db_path"`
+	VectorDBPath           string `json:"vector_db_path"`
+	IndexDBPath            string `json:"index_db_path"`
+	QdrantHost             string `json:"qdrant_host"`
+	QdrantPort             int    `json:"qdrant_port"`
+	QdrantTLS              bool   `json:"qdrant_tls"`
+	QdrantCollectionPrefix string `json:"qdrant_collection_prefix"`
+	QdrantAPIKeySet        bool   `json:"qdrant_api_key_set"`
+	Repository             string `json:"repository,omitempty"`
+	Finder                 string `json:"finder"`
+	ListenAddr             string `json:"listen_addr"`
+	Timeout                string `json:"timeout"`
+	GitHubTokenSet         bool   `json:"github_token_set"`
+	LLMProvider            string `json:"llm_provider"`
+	LLMAPIKeySet           bool   `json:"llm_api_key_set"`
+	LLMModel               string `json:"llm_model"`
+	LLMBaseURL             string `json:"llm_base_url,omitempty"`
+	EmbeddingProvider      string `json:"embedding_provider"`
+	EmbeddingModel         string `json:"embedding_model"`
+	EmbeddingBaseURL       string `json:"embedding_base_url"`
+	EmbeddingDimensions    int    `json:"embedding_dimensions"`
+	EmbeddingAPIKeySet     bool   `json:"embedding_api_key_set"`
+	DecisionProvider       string `json:"decision_provider"`
+	DecisionModel          string `json:"decision_model"`
+	DecisionEndpoint       string `json:"decision_endpoint"`
+	DecisionAPIKeySet      bool   `json:"decision_api_key_set"`
 }
 
 // AdapterStatus reports which effect ports are wired in the current binary composition.
@@ -43,28 +65,37 @@ type AdapterStatus struct {
 	CandidateFinder      bool `json:"candidate_finder"`
 	RelationshipAnalyser bool `json:"relationship_analyser"`
 	EmbeddedUI           bool `json:"embedded_ui"`
+	VectorIndex          bool `json:"vector_index"`
+	ChunkCatalog         bool `json:"chunk_catalog"`
+	VectorStore          bool `json:"vector_store"`
+	EmbeddingProvider    bool `json:"embedding_provider"`
+	DecisionProvider     bool `json:"decision_provider"`
 }
 
 // StatusReport summarizes application readiness, configuration, and adapter availability.
 type StatusReport struct {
-	Version       string        `json:"version"`
-	SchemaVersion int           `json:"schema_version"`
-	Config        StatusConfig  `json:"config"`
-	Adapters      AdapterStatus `json:"adapters"`
+	Version             string        `json:"version"`
+	SchemaVersion       int           `json:"schema_version"`
+	VectorSchemaVersion int           `json:"vector_schema_version"`
+	IndexSchemaVersion  int           `json:"index_schema_version"`
+	Config              StatusConfig  `json:"config"`
+	Adapters            AdapterStatus `json:"adapters"`
 }
 
 // Service coordinates domain operations across the CLI and HTTP API surfaces.
 type Service struct {
-	mu       sync.Mutex
-	cfg      config.Config
-	adapters Adapters
+	mu        sync.Mutex
+	cfg       config.Config
+	adapters  Adapters
+	retrieval *retrieval.Service
 }
 
 // NewService constructs the shared application service facade.
 func NewService(cfg config.Config, adapters Adapters) *Service {
 	return &Service{
-		cfg:      cfg,
-		adapters: adapters,
+		cfg:       cfg,
+		adapters:  adapters,
+		retrieval: retrieval.New(adapters.Store, adapters.Catalog, adapters.Vectors, adapters.Embedder),
 	}
 }
 
@@ -77,20 +108,42 @@ func (s *Service) Status(ctx context.Context) (StatusReport, error) {
 	if s.adapters.Store != nil {
 		schemaVersion = s.adapters.Store.SchemaVersion()
 	}
+	vectorVersion := 0
+	if s.adapters.Catalog != nil {
+		vectorVersion = s.adapters.Catalog.SchemaVersion()
+	}
 	return StatusReport{
-		Version:       Version,
-		SchemaVersion: schemaVersion,
+		Version:             Version,
+		SchemaVersion:       schemaVersion,
+		VectorSchemaVersion: vectorVersion,
+		IndexSchemaVersion:  vectorVersion,
 		Config: StatusConfig{
-			DBPath:         s.cfg.DBPath,
-			Repository:     s.cfg.Repository,
-			Finder:         s.cfg.Finder,
-			ListenAddr:     s.cfg.ListenAddr,
-			Timeout:        s.cfg.Timeout.String(),
-			GitHubTokenSet: s.cfg.GitHubTokenSet(),
-			LLMProvider:    config.NormalizeLLMProvider(s.cfg.LLMProvider),
-			LLMAPIKeySet:   s.cfg.LLMAPIKeySet(),
-			LLMModel:       s.cfg.LLMModel,
-			LLMBaseURL:     s.cfg.LLMBaseURL,
+			DBPath:                 s.cfg.DBPath,
+			VectorDBPath:           s.cfg.VectorPath(),
+			IndexDBPath:            s.cfg.IndexPath(),
+			QdrantHost:             s.cfg.QdrantHost,
+			QdrantPort:             s.cfg.QdrantPort,
+			QdrantTLS:              s.cfg.QdrantTLS,
+			QdrantCollectionPrefix: s.cfg.QdrantCollectionPrefix,
+			QdrantAPIKeySet:        s.cfg.QdrantAPIKeySet(),
+			Repository:             s.cfg.Repository,
+			Finder:                 s.cfg.Finder,
+			ListenAddr:             s.cfg.ListenAddr,
+			Timeout:                s.cfg.Timeout.String(),
+			GitHubTokenSet:         s.cfg.GitHubTokenSet(),
+			LLMProvider:            config.NormalizeLLMProvider(s.cfg.LLMProvider),
+			LLMAPIKeySet:           s.cfg.LLMAPIKeySet(),
+			LLMModel:               s.cfg.LLMModel,
+			LLMBaseURL:             s.cfg.LLMBaseURL,
+			EmbeddingProvider:      config.EmbeddingProvider,
+			EmbeddingModel:         config.EmbeddingModel,
+			EmbeddingBaseURL:       s.cfg.EmbeddingURL(),
+			EmbeddingDimensions:    s.cfg.EmbeddingSize(),
+			EmbeddingAPIKeySet:     s.cfg.EmbeddingAPIKeySet(),
+			DecisionProvider:       config.DecisionProvider,
+			DecisionModel:          s.cfg.DecisionModelName(),
+			DecisionEndpoint:       s.cfg.DecisionURL(),
+			DecisionAPIKeySet:      s.cfg.DecisionAPIKeySet(),
 		},
 		Adapters: AdapterStatus{
 			Storage:              s.adapters.Store != nil,
@@ -98,6 +151,11 @@ func (s *Service) Status(ctx context.Context) (StatusReport, error) {
 			CandidateFinder:      s.adapters.Finder != nil,
 			RelationshipAnalyser: s.adapters.Analyser != nil,
 			EmbeddedUI:           s.adapters.EmbeddedUI,
+			VectorIndex:          s.adapters.Catalog != nil && s.adapters.Vectors != nil,
+			ChunkCatalog:         s.adapters.Catalog != nil,
+			VectorStore:          s.adapters.Vectors != nil,
+			EmbeddingProvider:    s.adapters.Embedder != nil,
+			DecisionProvider:     s.adapters.Decider != nil,
 		},
 	}, nil
 }
